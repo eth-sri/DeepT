@@ -1,0 +1,2 @@
+if you run the scripts yourself, the results will be added here
+if you want to consult the reference results, consult the "reference_results" directory
