@@ -53,17 +53,12 @@ directory.
 To compute **results for all Tables**, run the script `get_results_all_tables.sh`, which will store the results in 
 the `Robustness-Verification-for-Transformers/results` directory, organized per experiment / Table.
 
-**Table 1, 2, 3**
+**Table 1, 2, 3, 4, 5, 6, 7, 13**
 
 To compute **the results for a particular Table**, for example Table 3, run the 
 script `get_results_table3.sh`, which will store the results for that experiment / Table 
 in a subdirectory of the `Robustness-Verification-for-Transformers/results` directory.
 
-**Table 4, 5**
-
-Both tables show the results of an ablation study, therefore **you must first compute 
-the results for Table 1**. Only once they **are fully computed**, can you run either 
-`get_results_table4.sh` (for Table 4) or `get_results_table5.sh` (for Table 5).
 
 ### Obtaining a summary of the data for each table
 
@@ -74,6 +69,10 @@ the results for Table 1**. Only once they **are fully computed**, can you run ei
 ### Reproducing the synonym attack results
 
 Run the script `get_results_synonym_attack.sh`, which will produce the statistics in stdout.
+
+### Reference results
+
+The reference results for Tables 1, 2, 3, 4, 5, 6, 7, 13 as well as the Analysis notebook obtain the result statistics are present in the `reference_results`.
 
 ## Other platforms
 
