@@ -4,11 +4,10 @@ cd ../..
 norm=2
 echo "The norm is $norm"
 
-for nlayers in 3 6 12; do
+for nlayers in 3; do
     echo "Verifying network with $nlayers layers"
 
     python3 main.py --verify \
-          --results-directory "results/yelp" \
           --data yelp \
           --dir yelp_bert_small_$nlayers --num_layers $nlayers \
           --method zonotope \

@@ -5,38 +5,27 @@
 VIRTUAL_ENV_DISABLE_PROMPT=true conda activate py37_transformers_verifier
 
 
-# Table 5: Fast vs Backward vs BaF - L1 and L2 - small network, due to memory issues with Backward)
-# --results-directory "results/l1l2"
+# Table 5: effect of the ordering of the norms in the fast version of the dot product transformer
+# --results-directory "results/other_dot_product_results" \
 
 CURRENT_DIR=$(realpath "$(dirname "$0")")
 
-# Get results for BaF (norm 1 and 2)
-cd "$CURRENT_DIR/../scripts/baf" || exit
-chmod +x run_baf_1_smaller_and_subset.sh
-bash run_baf_1_smaller_and_subset.sh
+if [ ! -d "$CURRENT_DIR/../results/normal_case/" ]; then
+  # Need the results for the normal case (with the softmax sum refinement)
+  cd "$CURRENT_DIR" || exit
+  bash ./get_results_table1.sh
+fi
 
-cd "$CURRENT_DIR/../scripts/baf" || exit
-chmod +x run_baf_2_smaller_and_subset.sh
-bash run_baf_2_smaller_and_subset.sh
+mkdir -p "$CURRENT_DIR/../results/other_dot_product_results/" || exit
+cd "$CURRENT_DIR" || exit
+cp "$CURRENT_DIR"/../results/normal_case/*zonotope_1_*WithConstraint* "$CURRENT_DIR/../results/other_dot_product_results/" || exit
+cp "$CURRENT_DIR"/../results/normal_case/*zonotope_2_*WithConstraint* "$CURRENT_DIR/../results/other_dot_product_results/" || exit
 
+# Get results for Fast (norms 1, 2, inf)
+cd "$CURRENT_DIR/../scripts/dot_product_ordering" || exit
+chmod +x run_zonotope_fast_1_other_dot_product.sh
+bash run_zonotope_fast_1_other_dot_product.sh
 
-
-# Get results for Fast (norm 1 and 2)
-cd "$CURRENT_DIR/../scripts/fast" || exit
-chmod +x run_zonotope_fast_1_smaller_and_subset.sh
-bash run_zonotope_fast_1_smaller_and_subset.sh
-
-cd "$CURRENT_DIR/../scripts/fast" || exit
-chmod +x run_zonotope_fast_2_smaller_and_subset.sh
-bash run_zonotope_fast_2_smaller_and_subset.sh
-
-
-
-# Get results for Backward (norm 1 and 2)
-cd "$CURRENT_DIR/../scripts/backward" || exit
-chmod +x run_backward_1_smaller_and_subset.sh
-bash run_backward_1_smaller_and_subset.sh
-
-cd "$CURRENT_DIR/../scripts/backward" || exit
-chmod +x run_backward_2_smaller_and_subset.sh
-bash run_backward_2_smaller_and_subset.sh
+cd "$CURRENT_DIR/../scripts/dot_product_ordering" || exit
+chmod +x run_zonotope_fast_2_other_dot_product.sh
+bash run_zonotope_fast_2_other_dot_product.sh

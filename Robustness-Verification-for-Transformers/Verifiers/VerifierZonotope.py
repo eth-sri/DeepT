@@ -1,9 +1,10 @@
 import copy
 import time
 import math
-from typing import Tuple, List, Optional
+from typing import Tuple, List
 
 import torch
+from termcolor import colored
 
 from Verifiers import Verifier
 from Verifiers.Zonotope import Zonotope, make_zonotope_new_weights_same_args, cleanup_memory
@@ -73,39 +74,21 @@ class VerifierZonotope(Verifier):
         return violations_per_layer
 
     def verify_safety(self, example, embeddings, index, eps, initial_zonotope_weights: torch.Tensor = None):
-        bounds_difference_scores = self.get_bounds_difference_in_scores(
-            embeddings, index, eps, initial_zonotope_weights=initial_zonotope_weights
-        )
-        if bounds_difference_scores is None:
-            model_is_robust = False  # There was an exception or some pre-conditions were not met
-        else:
-            l, u = bounds_difference_scores
-            model_is_robust = self.get_safety(label=example["label"], lower_bound=l, upper_bound=u)
-
-        if self.should_collect_zonotopes:
-            return model_is_robust, self.zonotopes_bounds[:]
-        else:
-            return model_is_robust
-
-    def get_bounds_difference_in_scores(
-        self, embeddings: torch.Tensor, index: int, eps: float, gradient_enabled=False, initial_zonotope_weights: torch.Tensor = None
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if self.args.error_reduction_method == "None" and not self.showed_warning:
-            START_WARNING = '\033[93m'
-            END_WARNING = '\033[0m'
-            print(START_WARNING + "Warning: No error reduction method for Zonotope verifier!" + END_WARNING)
+            WARNING = '\033[93m'
+            ENDC = '\033[0m'
+            print(WARNING + "Warning: No error reduction method for Zonotope verifier!" + ENDC)
             self.showed_warning = True
 
         cleanup_memory()
         errorType = OSError if self.debug else AssertionError
 
+        start_verification_time = time.time()
         try:
-            with torch.set_grad_enabled(gradient_enabled):
-
+            with torch.no_grad():
                 bounds = self._bound_input(embeddings, index=index, eps=eps, initial_zonotope_weights=initial_zonotope_weights)  # hard-coded yet
 
-                if self.args.check_zonotopes:
-                    check_zonotope("embedding", zonotope=bounds, actual_values=self.std["embedding_output"], verbose=self.verbose)
+                # check_zonotope("embedding", zonotope=bounds, actual_values=self.std["embedding_output"], verbose=self.verbose)
 
                 if self.verbose:
                     bounds.print("embedding")
@@ -131,29 +114,37 @@ class VerifierZonotope(Verifier):
                         check_zonotope("layer %d self_attention_output" % i, zonotope=self_attention_output, actual_values=self.std["self_output"][i][0], verbose=self.verbose)
                         check_zonotope("layer %d" % i, zonotope=bounds, actual_values=self.std["encoded_layers"][i], verbose=self.verbose)
 
-                    if not self.args.keep_intermediate_zonotopes:
-                        del attention_scores, attention_probs, self_attention_output
-                        cleanup_memory()
+                    del attention_scores, attention_probs, self_attention_output
+                    cleanup_memory()
 
                 bounds = self._bound_pooling(bounds, self.pooler)
                 if self.args.check_zonotopes:
                     check_zonotope("pooled output", zonotope=bounds, actual_values=self.std["pooled_output"], verbose=self.verbose)
 
-                l, u = self._bound_classifier(bounds, self.classifier)
-                return l, u
+                safety = self._bound_classifier(bounds, self.classifier, example["label"])
+
+                end_verification_time = time.time()
+                # print("Time for iteration: %fs" % (end_verification_time - start_verification_time))
+
+                if self.should_collect_zonotopes:
+                    return safety, self.zonotopes_bounds[:]
+                else:
+                    return safety
         except errorType as err:  # for debug
             if self.verbose:
                 print("Warning: failed assertion")
                 print(err)
-            # raise yerr
-            return None
+            print("Warning: failed assertion", eps)
+            print(err)
+            # raise err
+            return False
 
     def store_zonotope_bounds(self, zonotope: Zonotope, zonotope_description: str):
         if self.should_collect_zonotopes:
             l, u = zonotope.concretize()
             self.zonotopes_bounds.append((l, u, zonotope_description))
 
-    def _bound_input(self, embeddings: torch.Tensor, index: int, eps: float, initial_zonotope_weights: torch.Tensor = None) -> Zonotope:
+    def _bound_input(self, embeddings, index, eps, initial_zonotope_weights: torch.Tensor = None) -> Zonotope:
         if initial_zonotope_weights is None:
             assert embeddings[0].shape[1] == self.args.num_input_error_terms, "Invalid num error terms"
             bounds = Zonotope(self.args, p=self.p, eps=eps, perturbed_word_index=index, value=embeddings[0])
@@ -226,6 +217,9 @@ class VerifierZonotope(Verifier):
                 bounds_input_reduced_box = bounds_input.reduce_num_error_terms_box(max_num_error_terms=self.args.max_num_error_terms)
             bounds_input = bounds_input_reduced_box
             # print(f"Layer {layer_num} - after box reduction there are {bounds_input.num_error_terms} noise symbols")
+        elif self.args.error_reduction_method == 'pca':
+            bounds_input_reduced_pca = bounds_input.remove_num_error_terms_pca(max_num_error_terms=self.args.max_num_error_terms)
+            bounds_input = bounds_input_reduced_pca
 
         if self.args.log_error_terms_and_time:
             print("Bound_input after PCA reduction has %d error terms" % bounds_input.num_error_terms)
@@ -245,9 +239,7 @@ class VerifierZonotope(Verifier):
 
         attention = attention.layer_norm(layer.attention.output.LayerNorm, self.layer_norm)
         self.store_zonotope_bounds(attention, "Attention after Dense + Input -> Layer Norm")
-
-        if not self.args.keep_intermediate_zonotopes:
-            del bounds_input
+        del bounds_input
 
         if self.verbose:
             attention.print("after attention layernorm")
@@ -264,10 +256,8 @@ class VerifierZonotope(Verifier):
         attention = attention.expand_error_terms_to_match_zonotope(intermediate)
         dense = intermediate.dense(layer.output.dense).add(attention)
         self.store_zonotope_bounds(dense, "Dense")
-
-        if not self.args.keep_intermediate_zonotopes:
-            del intermediate
-            del attention
+        del intermediate
+        del attention
 
         if self.verbose:
             print("dense norm", torch.norm(layer.output.dense.weight, p=self.p))
@@ -311,8 +301,8 @@ class VerifierZonotope(Verifier):
         query = bounds_input.dense(attention.self.query)
         key = bounds_input.dense(attention.self.key)
 
-        query = query.add_attention_heads_dim(num_attention_heads)  # (A, 1 + #error, length, E)
-        key = key.add_attention_heads_dim(num_attention_heads)  # (A, 1 + #error, length, E)
+        query = query.add_attention_heads_dim(num_attention_heads)
+        key = key.add_attention_heads_dim(num_attention_heads)
 
         self.store_zonotope_bounds(query, "Queries")
         self.store_zonotope_bounds(key, "Keys")
@@ -324,10 +314,8 @@ class VerifierZonotope(Verifier):
         if self.verbose:
             attention_scores.print("attention score")
 
-        if not self.args.keep_intermediate_zonotopes:
-            del query
-            del key
-
+        del query
+        del key
         attention_probs = attention_scores.softmax(verbose=self.verbose, no_constraints=not self.args.add_softmax_sum_constraint)
         self.store_zonotope_bounds(attention_probs, "Attention Probs")
 
@@ -355,10 +343,7 @@ class VerifierZonotope(Verifier):
             attention_probs.print("attention probs")
 
         value = bounds_input.dense(attention.self.value)
-
-        if not self.args.keep_intermediate_zonotopes:
-            del bounds_input
-
+        del bounds_input
         value = value.add_attention_heads_dim(num_attention_heads)
         self.store_zonotope_bounds(value, "Values")
         context = self.do_context(attention_probs, value, layer_num)
@@ -399,7 +384,7 @@ class VerifierZonotope(Verifier):
             bounds.print("pooling after activation")
         return bounds
 
-    def _bound_classifier(self, bounds: Zonotope, classifier) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _bound_classifier(self, bounds: Zonotope, classifier, label) -> bool:
         # 1) They compute linear layer that computes the how higher class 0 is over class 1
         # 2) They multiply the bounds by that linear layer's matrix
         # 3) They concretize the bounds (e.g. they compute the actual values, instead of having error terms)
@@ -408,30 +393,38 @@ class VerifierZonotope(Verifier):
             bounds_normal = bounds.dense(classifier)
             self.store_zonotope_bounds(bounds_normal, "Classifier output")
 
-        # TODO: the classifier weights below will be adapted by the optimizer, I need to fix this
-        new_classifier = copy.deepcopy(classifier)
-        new_classifier.weight = torch.nn.Parameter((classifier.weight[0:1, :] - classifier.weight[1:2, :]).clone().detach())
-        new_classifier.bias = torch.nn.Parameter((classifier.bias[0] - classifier.bias[1]).clone().detach())
+        classifier = copy.deepcopy(classifier)
+        classifier.weight[0, :] -= classifier.weight[1, :]
+        classifier.bias[0] -= classifier.bias[1]
 
         if self.verbose:
             bounds.print("before dense")
-            print(torch.norm(new_classifier.weight[0, :]))
+            print(torch.norm(classifier.weight[0, :]))
             print(torch.mean(torch.norm(bounds.zonotope_w, dim=-2)))
-            print(torch.mean(torch.norm(bounds.dense(new_classifier).zonotope_w, dim=-2)))
+            print(torch.mean(torch.norm(bounds.dense(classifier).zonotope_w, dim=-2)))
 
-        bounds = bounds.dense(new_classifier)
+        bounds = bounds.dense(classifier)
 
         if self.verbose:
             bounds.print("after dense")
 
         l, u = bounds.concretize()
-        # print("l and u shapes", l.shape, u.shape)
-        return l[0][0], u[0][0]
 
-    def get_safety(self, label: int, lower_bound: torch.Tensor, upper_bound: torch.Tensor) -> bool:
+        if self.verbose:
+            print(l[0][0])
+            print(u[0][0])
+
         if label == 0:
-            model_is_robust = lower_bound > 0
-        else:
-            model_is_robust = upper_bound < 0
+            safe = l[0][0] > 0
+            # if not safe.item():
+            #     print(f"Not safe by {-l[0][0]}")
 
-        return model_is_robust.item()
+        else:
+            safe = u[0][0] < 0
+            # if not safe.item():
+            #     print(f"Not safe by {u[0][0]}")
+
+        if self.verbose:
+            print("Safe" if safe else "Unsafe")
+
+        return safe.item()

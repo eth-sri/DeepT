@@ -6,7 +6,7 @@ import time
 
 import os
 import torch
-from typing import Tuple, Optional
+from typing import Tuple
 
 from termcolor import colored
 
@@ -47,6 +47,7 @@ class Verifier:
             self.encoding_layers = target.model.model_from_embeddings.bert.encoder.layer
             self.pooler = target.model.model_from_embeddings.bert.pooler
             self.classifier = target.model.model_from_embeddings.classifier
+
 
         self.hidden_act = args.hidden_act
         self.layer_norm = target.model.config.layer_norm if hasattr(target.model.config, "layer_norm") else "standard"
@@ -89,14 +90,16 @@ class Verifier:
         Returns:
             number of safe sentences, number of examples, percentage of sentence that are safe
         """
+        # examples = sample(self.args, data, self.target, num_samples=1000)
         with torch.no_grad():
-            # compute_accuracy(self.args, data, self.target)
+            llllll = compute_accuracy(self.args, data, self.target)
 
             # Accuracy(small3, adversarially trained):  1436/1821 = 78.5%
             # Accuracy(small3, normally trained):       1481/1821 = 81.3%
             # Accuracy(small3, certifiability trained): 1487/1821 = 81.5%
 
             examples = get_all_correctly_classified_samples(self.args, data, self.target)
+            # examples = [x for x in examples if 'Pacino' in x['sent_a']]
 
             if self.args.attack_type != "synonym":
                 print([' '.join(x['sent_a']) for x in examples])
@@ -114,7 +117,8 @@ class Verifier:
             num_eligible_sentences = 0
 
             for i, example in enumerate(examples):
-                should_test_sentence = num_eligible_sentences + 1 >= self.args.start_sentence
+
+                should_test_sentence = True #  (num_eligible_sentences + 1 >= self.args.start_sentence)
                 cleanup_memory()
                 is_safe, eligible_to_test, num_enumerations, timing = self.verify_against_synonym_attack(example, should_test_sentence)
                 was_tested = eligible_to_test and should_test_sentence
@@ -141,6 +145,8 @@ class Verifier:
             print(f"Num tested sentences (high permutation only): {num_tested_sentences}")
             print(f"Num safe sentences (high permutation only): {num_safe_sentences}")
             print(f"Percentage of high permutation sentences that could be verifier {num_safe_sentences / num_tested_sentences * 100}%")
+
+            # print(f"{num_safe_sentences} sentences out of {num_examples} sentence are safe. Fraction: {num_safe_sentences / num_examples * 100:.3f}%")
 
             self.results_file.close()
             return num_safe_sentences, num_tested_sentences, num_safe_sentences / num_tested_sentences
@@ -194,7 +200,22 @@ class Verifier:
             sum_avg += res[1]
             sum_min += res[2]
 
+        self.logger.write("{} valid examples".format(len(examples)))
+        self.logger.write("Minimum: {:.5f}".format(float(sum_min) / len(examples)))
+        self.logger.write("Average: {:.5f}".format(float(sum_avg) / len(examples)))
+
+        result = {
+            "examples": results,
+            "minimum": float(sum_min) / len(examples),
+            "average": float(sum_avg) / len(examples)
+        }
+
+
+
         self.results_file.close()
+
+        # with open(self.res_filename, "w") as file:
+        #     file.write(json.dumps(result, indent=4))
 
     def start_verification_new_input(self):
         pass
@@ -269,40 +290,7 @@ class Verifier:
 
         return is_safe, eligible_to_test, num_enumerations, timing
 
-    def get_bounds_difference_in_scores(
-            self, embeddings: torch.Tensor, index: int, eps: float, gradient_enabled=False, *args, **kwargs
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        raise NotImplementedError()
-
-    # These 2 methods below are specialized for the binary classification case
-    def get_loss(self, embeddings: torch.Tensor, eps: float, label: int, perturbed_word_index: int) -> torch.Tensor:
-        # Concrete lower and upper bounds of the expression (score(class 0) - score(class 1))
-        l, u  = self.get_bounds_difference_in_scores(embeddings, perturbed_word_index, eps, gradient_enabled=True)
-
-        if label == 0:
-            loss = -l  # c0 - c1 in [-3, 5] => c1 - c0 in [-5, 3] => max(score(class 0) - score(class 1)) = -(-3)
-        else:
-            loss = u   # c0 - c1 in [-3, 5]                       => max(score(class 0) - score(class 1)) = 5
-
-        return loss
-
-    def train_diffai(self, example, eps: float):
-        if self.args.with_lirpa_transformer:
-            embeddings, _, _, _ = self.target.get_input([example])
-        else:
-            embeddings, _ = self.target.get_embeddings([example])
-
-        start_word = 1
-        length = embeddings.shape[1]
-        for perturbed_word_index in range(start_word, length - 1):
-            with torch.autograd.set_detect_anomaly(True):
-                loss = self.get_loss(embeddings, eps, example["label"], perturbed_word_index)
-
-                self.target.optimizer.zero_grad()
-                loss.backward()
-                self.target.optimizer.step()
-
-    def verify(self, example, example_num: int, first_example=False):
+    def verify(self, example, example_num, first_example=False):
         """ Verify the given example sentence """
         start_time = time.time()
 
@@ -341,10 +329,36 @@ class Verifier:
             cnt = 0
             sum_eps, min_eps = 0, 1e30
 
-            max_refinement_iterations = 12
-            iteration_num = 0
-
             if self.args.all_words:
+                # warm up
+                # import pdb; pdb.set_trace()
+                # if not self.warmed:
+                #     if self.args.hardcoded_max_eps:
+                #         print(f"Using hardcoded max eps: {self.max_eps}")
+                #     else:
+                #         self.start_verification_new_input()
+                #         print("Warming up...")
+                #         went_up, went_down = False, False
+                #
+                #         while not self.verify_safety(example, embeddings, 1, self.max_eps):
+                #             print(f"eps {self.max_eps} - wasn't safe - dividing by 2")
+                #             self.max_eps /= 2
+                #             went_down = True
+                #         while not went_down and self.verify_safety(example, embeddings, 1, self.max_eps):
+                #             print(f"eps {self.max_eps} - was safe - multiplying by 2")
+                #             self.max_eps *= 2
+                #     self.warmed = True
+                #     print("Approximate maximum eps:", self.max_eps)
+
+                # [CLS] and [SEP] cannot be perturbed
+                # start_word = 1 if not first_example else self.args.start_word
+                #
+                # Consult generate_random_indices.py
+                # These number were generated once in a pre-processing step and then re-used
+                # for all verifiers, to ensure we are doing fair comparisons but without introducing
+                # any bias
+                # PREGENERATED_RANDOM_INDEX = [10, 13, 4, 12, 7, 11, 3, 6, 3, 2]
+
                 torch.cuda.reset_peak_memory_stats()
                 torch.cuda.max_memory_allocated()
 
@@ -367,6 +381,8 @@ class Verifier:
                     torch.cuda.reset_peak_memory_stats()
                     safe = self.verify_safety(example, embeddings, index=None, eps=r)
                     max_memory_used = max(max_memory_used, torch.cuda.max_memory_allocated())
+                    # print(f"   Max memory used: {max_memory_used}")
+                    # self.reset()
                 if l == 0:
                     while not safe:
                         r /= 2
@@ -374,6 +390,8 @@ class Verifier:
                         torch.cuda.reset_peak_memory_stats()
                         safe = self.verify_safety(example, embeddings, index=None, eps=r)
                         max_memory_used = max(max_memory_used, torch.cuda.max_memory_allocated())
+                        # print(f"   Max memory used: {max_memory_used}")
+                        # self.reset()
                     l, r = r, r * 2
                     print("\r{:.5f} {:.5f}".format(l, r), end="")
                 for j in range(num_iters):
@@ -386,6 +404,7 @@ class Verifier:
                     max_memory_used = max(max_memory_used, torch.cuda.max_memory_allocated())
                     print("\r{:.5f} {:.5f}".format(l, r), end="")
                 print()
+                # self.logger.write("Position {}: {} {:.5f}".format(i, tokens[i], eps[i], ))
                 end = time.time()
                 print("Binary search for max eps took {:.4f} seconds\n".format(end - start))
 
@@ -395,6 +414,7 @@ class Verifier:
                 self.results_file.flush()
             elif self.perturbed_words == 1:
                 # warm up
+                #import pdb; pdb.set_trace()
                 if not self.warmed:
                     if self.args.hardcoded_max_eps:
                         print(f"Using hardcoded max eps: {self.max_eps}")
@@ -403,20 +423,19 @@ class Verifier:
                         print("Warming up...")
                         went_up, went_down = False, False
 
-                        while iteration_num < max_refinement_iterations and not self.verify_safety(example, embeddings, 1, self.max_eps):
+                        while not self.verify_safety(example, embeddings, 1, self.max_eps):
                             print(f"eps {self.max_eps} - wasn't safe - dividing by 2")
                             self.max_eps /= 2
                             went_down = True
-                            iteration_num += 1
-                        while not went_down and iteration_num < max_refinement_iterations and self.verify_safety(example, embeddings, 1, self.max_eps):
+                        while not went_down and self.verify_safety(example, embeddings, 1, self.max_eps):
                             print(f"eps {self.max_eps} - was safe - multiplying by 2")
                             self.max_eps *= 2
-                            iteration_num += 1
                     self.warmed = True
                     print("Approximate maximum eps:", self.max_eps)
 
                 # [CLS] and [SEP] cannot be perturbed
                 start_word = 1 if not first_example else self.args.start_word
+
 
                 # Consult generate_random_indices.py
                 # These number were generated once in a pre-processing step and then re-used
@@ -434,7 +453,6 @@ class Verifier:
                         else:
                             print(colored(f"For sentence {example_num}, only processing word {i}", 'yellow'))
 
-                    iteration_num = 0
                     start = time.time()
                     self.start_verification_new_input()
                     # skip OOV
@@ -451,7 +469,7 @@ class Verifier:
                     max_memory_used = torch.cuda.max_memory_allocated()
                     # print(f"   Max memory used: {max_memory_used}")
 
-                    while safe and iteration_num < max_refinement_iterations:
+                    while safe:
                         l = r
                         r *= 2
                         print("\r{} {:.5f} {:.5f}".format(i, l, r), end="")
@@ -459,18 +477,16 @@ class Verifier:
                         safe = self.verify_safety(example, embeddings, i, r)
                         max_memory_used = max(max_memory_used, torch.cuda.max_memory_allocated())
                         # print(f"   Max memory used: {max_memory_used}")
-                        iteration_num += 1
-
+                        #self.reset()
                     if l == 0:
-                        while not safe and iteration_num < max_refinement_iterations:
+                        while not safe:
                             r /= 2
                             print("\r{} {:.5f} {:.5f}".format(i, l, r), end="")
                             torch.cuda.reset_peak_memory_stats()
                             safe = self.verify_safety(example, embeddings, i, r)
                             max_memory_used = max(max_memory_used, torch.cuda.max_memory_allocated())
                             # print(f"   Max memory used: {max_memory_used}")
-                            iteration_num += 1
-
+                            #self.reset()
                         l, r = r, r * 2
                         print("\r{} {:.5f} {:.5f}".format(i, l, r), end="")
                     for j in range(num_iters):
@@ -482,6 +498,7 @@ class Verifier:
                             r = m
                         max_memory_used = max(max_memory_used, torch.cuda.max_memory_allocated())
                         # print(f"   Max memory used: {max_memory_used}")
+                        #self.reset()
                         print("\r{} {:.5f} {:.5f}".format(i, l, r), end="")
                     print()
                     eps[i] = l
@@ -501,6 +518,8 @@ class Verifier:
                         f"{example_num},{i},{eps[i]},{end - start:f},{max_memory_used}\n"
                     )
                     self.results_file.flush()
+
+
             elif self.perturbed_words == 2:
                 # warm up
                 if not self.warmed:
@@ -561,7 +580,7 @@ class Verifier:
 
             result["time"] = time.time() - start_time
 
-            self.logger.write(f"Time elapsed for sentence {example_num}", result["time"])
+            self.logger.write("Time elapsed", result["time"])
 
             if cnt == 0:
                 return result, sum_eps, min_eps

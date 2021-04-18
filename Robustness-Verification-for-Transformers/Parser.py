@@ -145,14 +145,6 @@ class Parser(object):
         # Input
         parser.add_argument("--num-input-error-terms", type=int, default=128)
 
-        # DiffAI
-        parser.add_argument("--diffai", action="store_true")
-        parser.add_argument("--diffai-eps", type=float, default=0.01)
-        parser.add_argument("--keep-intermediate-zonotopes", action="store_true")
-
-        # ViT Verification
-        parser.add_argument("--concretize-special-norm-error-together", action="store_true")
-
         return parser
 
 
@@ -199,8 +191,5 @@ def update_arguments(args):
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     else:
         args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if args.diffai:
-        args.keep_intermediate_zonotopes = True
 
     return args

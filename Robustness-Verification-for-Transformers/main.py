@@ -287,23 +287,6 @@ with sess.as_default():
                 logger.add_test(target.step(batch)[:summary_num_pre])
             logger.save_test(log=True)
 
-    if args.diffai:
-        verifier = VerifierZonotope(args, target, logger)
-        random.seed(args.seed)
-        random.shuffle(data_train)
-        train_batches = get_batches(data_train, args.batch_size)
-        for i, example in enumerate(data_valid):
-            verifier.train_diffai(example, eps=args.diffai_eps)
-
-        for batch in valid_batches:
-            logger.add_valid(target.step(batch)[:summary_num_pre])
-        logger.save_valid(log=True)
-        for batch in test_batches:
-            logger.add_test(target.step(batch)[:summary_num_pre])
-        logger.save_test(log=True)
-
-        exit(0)
-
     data = data_valid if args.use_dev else data_test
 
     if args.pgd:

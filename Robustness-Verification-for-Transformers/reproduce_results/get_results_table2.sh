@@ -1,42 +1,26 @@
 #!/usr/bin/env bash
 
-
 # Activate conda
 . "$HOME/miniconda3/etc/profile.d/conda.sh"
 VIRTUAL_ENV_DISABLE_PROMPT=true conda activate py37_transformers_verifier
 
-# Table 2: Fast vs BaF (Yelp)
-# --results-directory "results/normal_case"
+
+# Table 2: Fast vs Precise vs Backward - Linf - small network, due to memory issues with Backward)
+# --results-directory "results/smaller_network_results"
 
 CURRENT_DIR=$(realpath "$(dirname "$0")")
 
+# Get results for BaF (norm inf)
+cd "$CURRENT_DIR/../scripts/backward" || exit
+chmod +x run_backward_inf_smaller_and_subset.sh
+bash run_backward_inf_smaller_and_subset.sh
 
-
-# Get results for BaF (norms 1, 2, inf)
-cd "$CURRENT_DIR/../scripts/baf" || exit
-chmod +x run_baf_1_yelp.sh
-bash run_baf_1_yelp.sh
-
-cd "$CURRENT_DIR/../scripts/baf" || exit
-chmod +x run_baf_2_yelp.sh
-bash run_baf_2_yelp.sh
-
-
-cd "$CURRENT_DIR/../scripts/baf" || exit
-chmod +x run_baf_inf_yelp.sh
-bash run_baf_inf_yelp.sh
-
-
-# Get results for Fast (norms 1, 2, inf)
+# Get results for Fast (norm inf)
 cd "$CURRENT_DIR/../scripts/fast" || exit
-chmod +x run_zonotope_fast_1_yelp.sh
-bash run_zonotope_fast_1_yelp.sh
+chmod +x run_zonotope_fast_inf_smaller_and_subset.sh
+bash run_zonotope_fast_inf_smaller_and_subset.sh
 
-cd "$CURRENT_DIR/../scripts/fast" || exit
-chmod +x run_zonotope_fast_2_yelp.sh
-bash run_zonotope_fast_2_yelp.sh
-
-
-cd "$CURRENT_DIR/../scripts/fast" || exit
-chmod +x run_zonotope_fast_inf_yelp.sh
-bash run_zonotope_fast_inf_yelp.sh
+# Get results for Precise (norm inf)
+cd "$CURRENT_DIR/../scripts/precise" || exit
+chmod +x run_zonotope_slow_inf_smaller_and_subset.sh
+bash run_zonotope_slow_inf_smaller_and_subset.sh

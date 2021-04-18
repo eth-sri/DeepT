@@ -1,7 +1,6 @@
 import math
 import random
 import gc
-import time
 from argparse import Namespace
 from math import sqrt
 from typing import Union, Tuple, Optional, List
@@ -16,6 +15,8 @@ from termcolor import colored
 
 from Verifiers.error_range_updater import get_updated_error_ranges_using_LP
 
+# from Verifiers.ConvexCombination import get_hyperplanes, bound_with_convex_combination, update_hyperplanes, get_initial_lambdas
+# from Verifiers.equality_test import my_zonotope, new_zonotope2
 from Verifiers.utils import INFINITY, dual_norm, DUAL_INFINITY
 
 epsilon = 1e-12
@@ -59,6 +60,62 @@ def tensor_and(*tensors: torch.Tensor) -> torch.Tensor:
 
 def fillna(tensor: torch.Tensor, val: float):
     tensor[tensor != tensor] = val
+
+
+def do_einsum(equation: str, *operands: torch.Tensor):
+    if True:
+        return torch.einsum(equation, *operands)
+    else:
+        return contract(equation, *operands, memory_limit=1024 * 1024 * 1024)
+
+
+def cov(x, rowvar=False, bias=False, ddof=None, aweights=None):
+    # Implementation from: https://github.com/pytorch/pytorch/issues/19037
+    """Estimates covariance matrix like numpy.cov"""
+    # ensure at least 2D
+    if x.dim() == 1:
+        x = x.view(-1, 1)
+
+    # treat each column as a data point, each row as a variable
+    if rowvar and x.shape[0] != 1:
+        x = x.t()
+
+    if ddof is None:
+        if bias == 0:
+            ddof = 1
+        else:
+            ddof = 0
+
+    w = aweights
+    if w is not None:
+        if not torch.is_tensor(w):
+            w = torch.tensor(w, dtype=torch.float)
+        w_sum = torch.sum(w)
+        avg = torch.sum(x * (w / w_sum)[:, None], 0)
+    else:
+        avg = torch.mean(x, 0)
+
+    # Determine the normalization
+    if w is None:
+        fact = x.shape[0] - ddof
+    elif ddof == 0:
+        fact = w_sum
+    elif aweights is None:
+        fact = w_sum - ddof
+    else:
+        fact = w_sum - ddof * torch.sum(w * w) / w_sum
+
+    xm = x.sub(avg.expand_as(x))
+
+    if w is None:
+        X_T = xm.t()
+    else:
+        X_T = torch.mm(torch.diag(w), xm).t()
+
+    c = torch.mm(X_T, xm)
+    c = c / fact
+
+    return c.squeeze()
 
 
 def get_norm(tensor: torch.Tensor, p: float, dim: Union[int, List[int]]) -> torch.Tensor:
@@ -137,8 +194,7 @@ def sample_vector_with_p_norm_below_or_equal_to_1(number_values: int, p: float, 
 class Zonotope:
     def __init__(self, args: Namespace, p: float, eps: float, perturbed_word_index: int, value: torch.Tensor = None,
                  zonotope_w: torch.Tensor = None,
-                 error_term_range_low: torch.Tensor = None, error_term_range_high: torch.Tensor = None, clone=True,
-                 start_perturbation=None, end_perturbation=None):
+                 error_term_range_low: torch.Tensor = None, error_term_range_high: torch.Tensor = None, clone=True):
         self.args = args
         self.device = value.device if value is not None else zonotope_w.device
         self.p = p
@@ -153,7 +209,7 @@ class Zonotope:
         self.error_term_range_high: torch.Tensor = error_term_range_high  # Should be +1 normally
 
         if zonotope_w is not None:
-            assert not torch.isnan(zonotope_w).any(), "Zonotope creation: Some values in zonotope_w are NaNs"
+            assert not torch.isnan(zonotope_w).any(), "Some values in zonotope_w are NaNs"
 
             self.zonotope_w = zonotope_w.clone() if clone else zonotope_w
             if zonotope_w.ndim == 3:
@@ -166,12 +222,8 @@ class Zonotope:
                 self.word_embedding_size = zonotope_w.shape[3]
         else:
             self.num_words, self.word_embedding_size = value.shape
-
-            start = 1 if start_perturbation is None else start_perturbation
-            end = self.num_words - 1 if end_perturbation is None else end_perturbation
-
             if self.args.all_words:
-                self.num_error_terms = self.word_embedding_size * (end - start)
+                self.num_error_terms = self.word_embedding_size * (self.num_words - 2)
             else:
                 self.num_error_terms = self.word_embedding_size
 
@@ -195,8 +247,7 @@ class Zonotope:
             # which means that the i-th coordinate of the embedding of the perturbed word should depend on the i-th error term
             if self.args.all_words:
                 error_index = 1
-
-                for w in range(start, end):
+                for w in range(1, self.num_words - 1):
                     for j in range(self.word_embedding_size):
                         self.zonotope_w[error_index, w, j] = self.eps
                         error_index += 1
@@ -228,6 +279,7 @@ class Zonotope:
         return self.num_error_terms
 
     def compact_errors(self) -> "Zonotope":
+        # TODO: check for error and use this
         assert self.error_term_range_low is None, "compact error: low"
         assert self.error_term_range_high is None, "compact error: high"
 
@@ -263,6 +315,147 @@ class Zonotope:
             new_zonotope_w = torch.cat([self.zonotope_w, extra_zeros], dim=1)
 
         return make_zonotope_new_weights_same_args(new_zonotope_w, source_zonotope=other, clone=False)  # We use other because it has the correct error ranges
+
+    def remove_num_error_terms_pca(self, max_num_error_terms: int) -> "Zonotope":
+        """ Use the PCA technique to reduce the number of error terms
+        The precision loss should be smaller than the Box technique for error reduction (used in remove_error_terms)
+        Paper: Methods for order reduction of zonotopes - IEEE Conference Publication
+        """
+        assert self.zonotope_w.ndim == 3, "PCA error reduction doesn't support multi attention heads yet"
+
+        # TODO: currently, I'm not sure if how many error terms are removed / remain
+        # I should make sure this information is correct
+
+        # In their structure, the zonotopes are shaped as
+        # matrices of shape: num_values x (1 + num_error_terms)
+        # My zonotope_w has shape: 1 + num_error_terms x num_words x embedding_size
+        # Therefore I likely need to reshape zonotope_w so that it has
+        # the shape expected by their code
+        if self.num_error_terms <= max_num_error_terms:
+            return self
+
+        error_terms = self.zonotope_w[1:]  # num_error_terms x num_words x embedding_size
+        reshaped_weights = error_terms.reshape(self.num_error_terms, -1)  # num_error_terms x (num_words * embedding_size)
+        reshaped_weights = reshaped_weights.permute(1, 0)  # (num_words * embedding_size) x num_error_terms
+
+        indices_not_to_reduce, indices_to_reduce = self.pick_error_terms_to_remove(reshaped_weights, max_num_error_terms)
+        error_terms_to_reduce = reshaped_weights[:, indices_to_reduce]
+
+        # obtain matrix of points from generator matrix
+        V_data = torch.cat([error_terms_to_reduce, -error_terms_to_reduce], dim=-1)
+
+        # compute the covariance matrix (on the centered data)
+        mean = V_data.mean(dim=1, keepdim=True)
+        num_columns = V_data.size(1)
+        translation = mean @ torch.ones(1, num_columns, device=self.device)
+        sample_matrix = V_data - translation
+        C = cov(sample_matrix.t())
+
+        # Question: why SVD?
+        # Eig makes sense to me, but not sure my SVD on the covariance makes sense.
+
+        # singular value decomposition
+        # print("Number of NaN values in C: ", torch.isnan(C).float().sum(), " / ", C.nelement())
+        # C_numpy = C.cpu().numpy(); U_numpy, _, _ = numpy_svd(C_numpy); U = torch.from_numpy(U_numpy).to(self.device)
+        # V_data_svd = V_data.t()
+        # Y = V_data_svd.t() / (V_data_svd.size(1) - 1)**0.5
+        # U, S, V = torch.svd(Y)
+        # PC = V  # Principal components, aka transformation matrix, but
+        def get_svd(x):
+            if True:
+                return torch.svd(x)
+            else:
+                x_numpy = x.cpu().numpy()
+                u, s, v = np.linalg.svd(x_numpy)
+                return torch.from_numpy(u).to(x.device), torch.from_numpy(s).to(x.device), torch.from_numpy(v).to(x.device)
+
+        if False:
+            M, N = V_data.size(0), V_data.size(1)
+            Y = V_data.t() / sqrt(N - 1)
+            U, S, PC = get_svd(Y)
+            PC = PC.t()
+            G_trans = PC.t() @ error_terms_to_reduce  # map generators to new space
+            bounds_per_dimension = G_trans.abs().sum(dim=1)  # get box bounds in new space
+            G_box = torch.diag(bounds_per_dimension)  # get box error generators in new space
+            error_terms_reduced = PC @ G_box  # map bor error generators back in old space
+        elif True:
+            U, S, V = get_svd(C)
+            # U = U.t()
+            G_trans = U.t() @ error_terms_to_reduce  # map generators
+            bounds_per_dimension = G_trans.abs().sum(dim=1)
+            G_box = torch.diag(bounds_per_dimension)
+            error_terms_reduced = U @ G_box  # transform generators back
+        else:
+            U, S, V = torch.pca_lowrank(V_data.t(), q=2560, center=True, niter=2)
+            G_trans = V.t() @ error_terms_to_reduce  # map generators
+            bounds_per_dimension = G_trans.abs().sum(dim=0)
+            G_box = torch.diag(bounds_per_dimension)
+            error_terms_reduced = V @ G_box  # transform generators back
+            # PC = PC.t()
+
+        # U has n columns, which are the n most important linearly independent directions
+        #       In which space?
+        #       Why is its shape [num_dims, num_dims] instead of [num_dims, prev_number_error_terms]?
+        #
+        # U is orthogonal, since U^T U = U, since all directions are independent/orthogonal
+        # U is the basis of the new error space
+        # U^T * error_terms_to_be_reduced = [num_dims, num_dims] @ [num_dims, prev_number_error_terms]
+        #                                 = [num_dims, prev_number_error_terms]
+        # f_U is the function maps a vector in the new space to a vector in the old space
+        # the value in U represent the basis of the new space in the coordinates of the old space
+        #               new_error_space_vector -> old_error_space_vector
+        # and therefore f_U_inv maps
+        #               old_error_space_vector -> new_error_space_vector
+        # f_U(f_U_inv(error_terms)) = error_terms
+        #
+        # U^T is the transformation matrix P, that maps from the old space to the new nice clean space
+        #
+        # G_trans = PC.t() @ error_terms_to_reduce  # map generators
+
+        # m = number of error terms
+        # column has m elements
+        # matrix has n observations/rows with m elements
+        # e.g Matrix shape is (n, m)
+        # n = number of dims, e.g. embedding values
+        # m = number of error terms
+        # column = vector of our zonotope (expressed in original error space)
+        #
+        # for the SVD version of PCA, we assume that X is shaped in the order [number_dims, number_error_terms]
+        # or in other words [number_observations, number_axis]
+        # e.g. one row is one observation
+        #
+        # V is a basis in the error terms space, e.g. a collection of vector expressed in terms of e_j
+        # U is a basis in the dims space, e.g. a collection of vector expressed in terms of embedding_j
+        #
+        # V is a basis in the row space of X, e.g. it's a basis for the inputs of X, e.g. it's a basis for the number_error_terms
+        # V is a basis in the column space of X, e.g. it's a basis for the output of X, e.g. it's a basis for the embeddings
+
+        # PCA assumes that the new basis is a LINEAR combination of the original basis
+        # e.g. the new error space basis is a LINEAR combination of the original error space basis
+
+        # Find out the box for the zonotope represented by G_trans -> shape = (num_dims)
+        # bounds_per_dimension = G_trans.abs().sum(dim=1)
+
+        # Express the box (as a zonotope)
+        # G_box = torch.diag(bounds_per_dimension)
+
+        # Map the box (expressed as a zonotope) in the new space back to the original space
+        # error_terms_reduced = PC @ G_box   # transform generators back
+
+        # Shape: (num_words * embedding_size) x n_reduced_error_terms
+        error_terms_reduced_right_shape = error_terms_reduced.permute(1, 0)
+        # Shape: n_reduced_error_terms x (num_words * embedding_size)
+        error_terms_reduced_right_shape = error_terms_reduced_right_shape.reshape(error_terms_reduced_right_shape.size(0), self.num_words,
+                                                                                  self.word_embedding_size)
+        # Shape: n_reduced_error_terms x num_words x embedding_size
+
+        new_zonotope_w = torch.cat([
+            self.zonotope_w[0:1],
+            error_terms[indices_not_to_reduce],
+            error_terms_reduced_right_shape
+        ])
+        # print("Reduce error terms... Original shape: %s       New shape: %s" % (self.zonotope_w.shape, new_zonotope_w.shape))
+        return make_zonotope_new_weights_same_args(new_zonotope_w, source_zonotope=self, clone=False)  # Because torch.cat() makes a copy
 
     def pick_error_terms_to_remove(self, weights: torch.Tensor, final_number_terms: int) -> Tuple[torch.Tensor, torch.Tensor]:
         G = weights
@@ -350,24 +543,11 @@ class Zonotope:
             self.num_words * self.word_embedding_size, self.num_words, self.word_embedding_size, device=self.device
         )
 
-        # Check if new version behaves identically
-        errors, rows, cols = [], [], []
         pos = 0
         for word_index in range(self.num_words):
             for embedding_index in range(self.word_embedding_size):
-                errors.append(pos)
-                rows.append(word_index)
-                cols.append(embedding_index)
+                aggregated_errors_coeffs_good_shape[pos, word_index, embedding_index] = aggregated_errors_coeffs[word_index, embedding_index]
                 pos += 1
-
-        # still inplace
-        aggregated_errors_coeffs_good_shape[errors, rows, cols] = aggregated_errors_coeffs[rows, cols]
-
-        # pos = 0
-        # for word_index in range(self.num_words):
-        #     for embedding_index in range(self.word_embedding_size):
-        #         aggregated_errors_coeffs_good_shape[pos, word_index, embedding_index] = aggregated_errors_coeffs[word_index, embedding_index]
-        #         pos += 1
 
         new_zonotope_w = torch.cat([
             self.zonotope_w[0:1 + num_original_error_terms_to_keep],
@@ -479,8 +659,8 @@ class Zonotope:
 
             if self.p == 1 or self.p == 2:
                 width = self.get_width_for_special_terms(input_special_norm_errors)
-                lower = lower - width
-                upper = upper + width
+                lower -= width
+                upper += width
         else:
             assert self.error_term_range_high is not None, "error_term_range_low is not None but error_term_range_high is None"
 
@@ -509,8 +689,8 @@ class Zonotope:
             upper = center + new_errors_max.sum(dim=0)
             if input_special_norm_errors.nelement() > 0:
                 width = self.get_width_for_special_terms(input_special_norm_errors)
-                lower = lower - width
-                upper = upper + width
+                lower -= width
+                upper += width
 
             if self.zonotope_w.ndim == 4:
                 # (A * length, width) -> (A, length, width)
@@ -526,11 +706,9 @@ class Zonotope:
         if q is None:
             q = self.dual_p
 
-        error_dim = 0 if input_special_norm_errors.ndim <= 3 else 1
-        if self.args.concretize_special_norm_error_together:
-            width = get_norm(input_special_norm_errors, p=q, dim=error_dim)
-        elif self.args.perturbed_words == 1:
-            width = get_norm(input_special_norm_errors, p=q, dim=error_dim)
+        sum_dim = 0 if input_special_norm_errors.ndim <= 3 else 1
+        if self.args.perturbed_words == 1:
+            width = get_norm(input_special_norm_errors, p=q, dim=sum_dim)
         else:
             N = self.args.perturbed_words
             E = self.num_input_error_terms_special_norm // self.args.perturbed_words
@@ -582,26 +760,348 @@ class Zonotope:
         else:
             assert False, "Matmul with weight matrix with %d dimensions not supported (exact shape = %s)" % (W.dim(), W.shape)
 
-    def multiply(self, other: Union[float, "Zonotope", torch.Tensor]):
+    def multiply(self, W: Union[float, "Zonotope", torch.Tensor]):
         """ Multiply by either a float, Bounds or a matrix. Takes into account the signs to
         ensure the compute lower and upper bounds weights and biases are correct. """
-        if isinstance(other, float):
-            return make_zonotope_new_weights_same_args(new_weights=self.zonotope_w * other, source_zonotope=self, clone=False)
-        elif isinstance(other, Zonotope):
-            assert self.zonotope_w.ndim == 3, "Multiply: self should have 3 dims"
-            assert other.zonotope_w.ndim == 3, "Multiply: other should have 3 dims"
-            assert self.zonotope_w.shape[1:] == other.zonotope_w.shape[1:], "Multiply: Zonotope should have the same shape"
-
-            return self.do_multiply(other)
+        if type(W) == float:
+            return make_zonotope_new_weights_same_args(new_weights=self.zonotope_w * W, source_zonotope=self, clone=False)
+        # elif type(W) == Zonotope:
+        #     assert (self.zonotope_w.shape == W.zonotope_w.shape), "Zonotopes have different shape"
+        #
+        #     # TODO: this multiply abstract transformer uses the precise variant of the dot product abstract transformer
+        #     # instead of the fast version. Since we never use this abstract transformer (with the new softmax), it
+        #     # doesn't matter, but for the future it would be nice to offer both variants to the user
+        #
+        #     # Let x = x0 + sum(x_i * e_i)  and   y = y0 + sum(y_i * e_i)
+        #     # then
+        #     # x * y = (x0 + sum(x_i * e_i)) * (y0 + sum(y_i * e_i))
+        #     #       = x0 * y0
+        #     #       + x0 * sum(y_i * e_i)
+        #     #       + y0 * sum(x_i * e_i)
+        #     #       + sum_i_j(x_i * y_j * e_i * e_j)
+        #     #       = x0 * y0  +
+        #     #       + sum((x0 * y_i  + y0 * x_i) e_i)
+        #     #       + sum_i_j(x_i * y_j * e_i * e_j)
+        #     #    we introduce the approximation here by using "e_i * e_i is in [0, 1] and e_i * e_j is in [-1, 1] (for i != j)"
+        #     #       = (x0 * y0 + 0.5 * sum_i(x_i * y_i))  +
+        #     #         + sum((x0 * y_i  + y0 * x_i) e_i)
+        #     #         + (0.5 * sum_i(x_i * y_i) + sum_i<j[abs(x_i * y_j + x_j * y_i)]) * e_new
+        #     has_new_error_terms = torch.ones_like(self.zonotope_w[0], dtype=torch.bool)
+        #     n_new_error_terms = self.num_words * self.word_embedding_size
+        #
+        #     shape = list(self.zonotope_w.shape)
+        #     shape[0] += n_new_error_terms
+        #     new_zonotope_w = torch.zeros(shape, device=self.args.device)
+        #
+        #     half_terms = 0.5 * (self.zonotope_w[1:] * W.zonotope_w[1:])
+        #     half_terms_sum = half_terms.sum(dim=0)
+        #
+        #     # Bias
+        #     new_zonotope_w[0] = self.zonotope_w[0] * W.zonotope_w[0] + half_terms_sum
+        #     # Old error terms
+        #     new_zonotope_w[1:1 + self.num_error_terms] = self.zonotope_w[0] * W.zonotope_w[1:] + W.zonotope_w[0] * self.zonotope_w[1:]
+        #
+        #     # New error weights which handle the squared error terms
+        #     # The technique relies on bundling all the squared error weights into one coefficient
+        #     # and relying on the fact that e_i * e_i is in [0, 1] and e_i * e_j is in [-1, 1] (for i != j)
+        #     new_error_weights = half_terms.abs().sum(dim=0)
+        #
+        #     for i in range(1, 1 + self.num_error_terms):
+        #         j_min = i + 1
+        #
+        #         errors_other_b = W.zonotope_w[j_min:, :, :]
+        #         errors_self_b = self.zonotope_w[j_min:, :, :]
+        #
+        #         num_repeats = errors_other_b.shape[0]
+        #         errors_self_a = self.zonotope_w[i, :, :].repeat(num_repeats, 1, 1)
+        #         errors_other_a = W.zonotope_w[i, :, :].repeat(num_repeats, 1, 1)
+        #
+        #         mixed_values1 = torch.mul(errors_self_a, errors_other_b)
+        #         mixed_values2 = torch.mul(errors_self_b, errors_other_a)
+        #         mixed_values = mixed_values1 + mixed_values2
+        #
+        #         new_error_weights += mixed_values.abs().sum(0)
+        #
+        #     # Add the new errors terms efficiently using slicing
+        #     i_error = self.zonotope_w.shape[0]
+        #     indices = torch.arange(i_error, i_error + n_new_error_terms)
+        #     new_zonotope_w[indices, has_new_error_terms] = new_error_weights[has_new_error_terms]
+        #
+        #     return make_zonotope_new_weights_same_args(new_zonotope_w, source_zonotope=self, clone=False)
         else:  # Matrix
             # Important: in this case, it's NOT a matrix multiplication, it's an ELEMENT-WISE multiplication
-            return make_zonotope_new_weights_same_args(new_weights=self.zonotope_w * other, source_zonotope=self, clone=False)
+            return make_zonotope_new_weights_same_args(new_weights=self.zonotope_w * W, source_zonotope=self, clone=False)
+
+    # def dot_product_einsum(self, other, N=None, **kwargs) -> "Zonotope":
+    #     """ N = sqrt(number of chunks) """
+    #     assert self.num_error_terms == other.num_error_terms, "Number of error terms mismatch (in dot product)!"
+    #     assert self.zonotope_w.ndim == 4, "self should have 4 dims"
+    #     assert other.zonotope_w.ndim == 4, "other should have 4 dims"
+    #
+    #     num_attention_heads = self.zonotope_w.shape[0]
+    #     nA = self.num_words
+    #     nB = other.num_words
+    #     n_new_error_terms = nA * nB
+    #
+    #     # TODO: deal better with terms that have no error in them
+    #
+    #     # Convention when doing do_einsum() operations: b = "Batch dim", h = "attention Head dim"
+    #
+    #     ###### PART 1 : NEW VALUES FOR THE CENTER #######
+    #     C_new = torch.zeros(num_attention_heads, self.zonotope_w.shape[1] + n_new_error_terms, nA, nB, device=self.args.device)
+    #     # "h" = attention Head dim, "a" -> nA dim, "b" -> nB dim, "e" -> Embedding dim
+    #     C_new[:, 0] = do_einsum("hae,hbe->hab", self.zonotope_w[:, 0], other.zonotope_w[:, 0])
+    #
+    #     # "h" = attention Head dim, "a" -> nA dim, "b" -> nB dim, "e" -> Embedding dim, "t" -> error term dim
+    #     values_i_i_new_batch = do_einsum("htae,htbe->htab", self.zonotope_w[:, 1:],
+    #                                      other.zonotope_w[:, 1:])  # Shape : (attention head, num error terms, nA, nB)
+    #     C_new[:, 0] += 0.5 * values_i_i_new_batch.sum(dim=1)  # Shape: (attention head, nA, nB)
+    #
+    #     ###### PART 2 : UPDATED COEFFICIENTS FOR THE EXISTING ERROR TERMS #######
+    #
+    #     # C[i, j] = A[i] * B[j] = A[i]_0 * B[j]_0  +
+    #     #                        + sum_k [ ( A[i]_0 * B[j]_k  +    B[j]_0 * A[i]_k )  * e_k ]     <---- THIS IS THE RELEVANT PART
+    #     #                        + sum_k_m [ A[i]_k * B[j]_m                          * e_k * e_m)
+    #
+    #     # self.zonotope_w[:, 0]   -> Shape : (attention heads, nA, embeddingSize)
+    #     # other.zonotope_w[:, 1:] -> Shape : (attention heads, num_error_terms, nB, embeddingSize)
+    #     # other.zonotope_w[:, 0]  -> Shape : (attention heads, nB, embeddingSize)
+    #     # self.zonotope_w[:, 1:]  -> Shape : (attention heads, num_error_terms, nA, embeddingSize)
+    #     # Output                  -> Shape : (attention heads, num_error_terms, nA, nB)
+    #     # "h" = attention Head dim, "a" -> nA dim, "b" -> nB dim, "e" -> Embedding dim, "k" -> error terms dim
+    #     sum_errors_1 = do_einsum("hae,hkbe->hkab", self.zonotope_w[:, 0], other.zonotope_w[:, 1:])
+    #     sum_errors_2 = do_einsum("hbe,hkae->hkab", other.zonotope_w[:, 0], self.zonotope_w[:, 1:])
+    #     C_new[:, 1:1 + self.num_error_terms] = sum_errors_1 + sum_errors_2
+    #
+    #     ###### PART 3 : CREATING THE COEFFICIENTS FOR THE NEW ERROR TERMS #######
+    #
+    #     # The pseudo-code below indicates how we would code it with loops
+    #
+    #     # for attention_head in range(num_attention_heads):
+    #     #     for a in range(1, 1 + self.num_error_terms):
+    #     #         for b in range(a + 1, 1 + self.num_error_terms):
+    #     #             # a-th error terms dimensions: n_words_A * embedding_size
+    #     #             # b-th error terms dimensions: n_words_B * embedding_size
+    #     #             # output size: n_words_A * n_words_B
+    #     #             error_self_a = self.zonotope_w[attention_head, a, :, :]
+    #     #             error_other_b = other.zonotope_w[attention_head, b, :, :]
+    #     #
+    #     #             error_self_b = self.zonotope_w[attention_head, b, :, :]
+    #     #             error_other_a = other.zonotope_w[attention_head, a, :, :]
+    #     #
+    #     #             result = error_self_a @ error_other_b.t()  + error_self_b @ error_other_a.t()
+    #     #             non_diagonal_error_terms_coeffs += result.abs()
+    #
+    #     ########################################################################################################################
+    #     #                                       MAKING SURE THINGS FIT INTO MEMORY                                             #
+    #     ########################################################################################################################
+    #     # Assuming that there are 4 attention head, 4000 error terms and 20 word, and that each int takes 4 bytes
+    #     # the size of the intermediate_result tensor would be 4 × 4000 × 4000 × 20 × 20 × 4 = 102400000000 = 102.4Gb
+    #     # this would of course never fit
+    #     # however, we could divide this into a few chunks so that it fits (for example, divide it in 20 chunks
+    #     # and process 5Gb at the time), which would still be much faster since we would have a Python loop running 20 times
+    #     # instead a Python loop for everytime attention_head and a, which would run 4 x 4000 = 16000 times    -> 800x less loops
+    #     #
+    #     # Measurements on the server show 143.87 GiB are needed for the dot_product in the context() call
+    #     # where error_terms_self.shape = (4, 3884, 20, 20) and error_terms_other.shape = (4, 3884, 32, 20)
+    #     # If we used the same formula with these numbers, we'd get that the space is 143GiB too, so our formula is correct
+    #     if N is None:
+    #         bytes_per_int = 4
+    #         memory_budget = 4 * 1024 * 1024 * 1024  # maximum 4Gib usage at once
+    #         size_if_computation_was_done_at_once = num_attention_heads * self.num_error_terms * other.num_error_terms * nA * nB * bytes_per_int
+    #
+    #         num_chunks = size_if_computation_was_done_at_once / memory_budget
+    #         N = math.ceil(math.sqrt(num_chunks))
+    #
+    #     T = self.num_error_terms
+    #     S = math.ceil(T / N)
+    #
+    #     # This computation is too big, it need to be divided into chunks
+    #     # But should we divide by error_terms (a, b) or by word (i, j)?
+    #     #   - the number of words might be different, but the number of error terms is the same
+    #     #   - since we sum over the (a, b) terms, that might be easier because what we're adding always has the same size (h, i, j)
+    #     #     and doesn't need to be carefully positioned (e.g. no indexing into the output). however, there's indexing of the input
+    #     # => We will divide into chunk (a, b) and sum over them. If there are T error terms and we need to divide into N² chunks,
+    #     #    then each square we'll process will have size (T/N, T/N). Let's call S = T / N.
+    #     #    then we'll process each chunk error_terms_self[:, S*i:S*(i + 1), :, :] and error_terms_other[:, S*i:S*(j + 1), :, :]
+    #
+    #     # self.zonotope_w: (attention heads, num error terms, nA, embedding sizeà
+    #     # other.zonotope_w: (attention heads, num error terms, nB, embedding sizeà
+    #     error_terms_self = self.zonotope_w[:, 1:]
+    #     error_terms_other = other.zonotope_w[:, 1:]
+    #
+    #     non_diagonal_error_terms_coeffs = None
+    #     for i in range(N):
+    #         for j in range(N):
+    #             # "h" = attention Head dim,
+    #             # "a" -> error term A in self, "b" -> error term B in other,
+    #             # "i" -> word i in self, "j" -> word j in other,
+    #             # "k" -> Embedding dim
+    #
+    #             # Note that that in the 1st line we select the i-th chunk of error_terms_self and the j-th chunk of error_terms_other
+    #             # while in the 2nd line we select the j-th chunk of error_terms_self and the i-th chunk of error_terms_other
+    #             # this ensures we add the right terms before doing the abs() call.
+    #             intermediate_result = do_einsum("haik,hbjk->habij", error_terms_self[:, S * i:S * (i + 1)],
+    #                                             error_terms_other[:, S * j:S * (j + 1)])
+    #             intermediate_result += do_einsum("hbik,hajk->habij", error_terms_self[:, S * j:S * (j + 1)],
+    #                                              error_terms_other[:, S * i:S * (i + 1)])
+    #
+    #             if non_diagonal_error_terms_coeffs is None:
+    #                 non_diagonal_error_terms_coeffs = intermediate_result.abs().sum(dim=[1, 2])
+    #             else:
+    #                 non_diagonal_error_terms_coeffs += intermediate_result.abs().sum(dim=[1, 2])
+    #
+    #             del intermediate_result
+    #             torch.cuda.empty_cache()
+    #
+    #     # Correction 1: there sholdn't terms involving repeated indices, i.e. the (a, a) and (b, b) terms, so we remove them here
+    #     # right_indices = torch.arange(repeated_diagonal_values_intermediate.size(1))
+    #     # An alternative way to do this correction is to fix zero out the (a, a) values in intermediate_result before computing non_diagonal_error_terms_coeffs
+    #     repeated_diagonal_values_intermediate = do_einsum("haik,hajk->haij", error_terms_self,
+    #                                                       error_terms_other)  # (attention head, error_terms, nA, nB)
+    #     repeated_diagonal_values = repeated_diagonal_values_intermediate.abs().sum(dim=1)  # Shape : (attention head, nA, nB)
+    #     non_diagonal_error_terms_coeffs -= (2 * repeated_diagonal_values)  # 2 times, once for (a, a) and one for (b, b)
+    #
+    #     # Correction 2: indices (a, b) ->  terms (a, b), (b, a)    AND  indices (b, a)  -> terms (b, a), (a, b)
+    #     # since we consider both pair of indices (a, b) and (b, a), we'll actually have treated the indices twice, so we need
+    #     # to half everything to get the right value
+    #     non_diagonal_error_terms_coeffs *= 0.5  # correct for considering both (a, b) and (b, a)
+    #
+    #     diagonal_error_term_coeffs = 0.5 * values_i_i_new_batch.abs().sum(dim=1)
+    #
+    #     new_weights = diagonal_error_term_coeffs + non_diagonal_error_terms_coeffs
+    #
+    #     ###### PART 4 : PUTTING THE COEFFICIENTS FOR THE NEW ERROR TERMS IN THE ZONOTOPE WEIGHT MATRIX #######
+    #
+    #     # C[:, indices, :, :] -> shape = (numAttentionHeads, nA * nB, nA, nB)
+    #     # half_term           -> shape = (numAttentionHeads, nA, nB)
+    #     # non_diagonal_error_terms_coeffs            -> shape = (numAttentionHeads, nA, nB)
+    #     # new_weights         -> shape = (numAttentionHeads, nA, nB)
+    #     has_error_terms = torch.ones(nA, nB, dtype=torch.bool, device=self.args.device)  # Used to pace the terms in the right spot
+    #     indices = torch.arange(1 + self.num_error_terms, 1 + self.num_error_terms + n_new_error_terms)
+    #     C_new[:, indices, has_error_terms] = new_weights[:, has_error_terms]
+    #
+    #     return make_zonotope_new_weights_same_args(C_new, source_zonotope=self, clone=False)
 
     def dot_product(self, other, *args, **kwargs) -> "Zonotope":
         if self.args.zonotope_slow:
             return self.dot_product_precise(other, *args, **kwargs)
         else:
             return self.dot_product_fast(other, *args, **kwargs)
+
+    def dot_product_precise_inf_inf_multiplicationv1(self, inf_terms1: torch.Tensor, inf_terms2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Input:
+        #    inf_terms1: (n_inf_termsA, nA, embeddingSize)
+        #    inf_terms1: (n_inf_termsB, nB, embeddingSize)
+        # Output:
+        #    center: (nA, nB)
+        #    error_coeffs: (nA, nB)
+        n_inf_terms_A, nA, embedding_size = inf_terms1.shape
+        n_inf_terms_B, nB, embedding_size = inf_terms2.shape
+        min_error_terms = min(n_inf_terms_A, n_inf_terms_B)
+
+        center = torch.zeros(nA, nB, device=self.args.device)
+        new_coeffs = torch.zeros(nA, nB, device=self.args.device)
+
+        # SECTION: MIXED ERROR TERMS e_i * e_i (update bias + error coefficient of new error term)
+        # For the e_i * e_i error terms that appear when doing the multiplication, we compute the value
+        # of the center of the inverval (which we add to the bias of the new zonotope) and the error coefficients
+        # of the new error coefficient (we do abs value)
+        values_i_i = torch.bmm(
+            inf_terms1[:min_error_terms],  # (n_error_termsMin, nA, embedding_size)
+            inf_terms2[:min_error_terms].permute(0, 2, 1)  # (n_error_termsMin, embedding_size, nB)
+        )  # Output shape: (embedding_size, nA, nB)
+
+        # The value for e_i * e_i will depend on all the term of the vector, which is computed in the BMM above
+        # For the error coefficients, I need to do abs().sum() instead of the reverse, because the formula is
+        # sum_a[ abs(sum_i v_i(a) * w_i(a)) ]
+        center += 0.5 * values_i_i.sum(dim=0)
+        new_coeffs += 0.5 * values_i_i.abs().sum(dim=0)
+
+        # SECTION: MIXED ERROR TERMS e_i * e_j (compute the error coefficient of new error terms)
+        for a in range(min_error_terms):
+            # there's no point in taking a in the range [min_errors + 1, last_error]
+            # because then b > min_error + 1
+            # and so either
+            #    1) errors_other_b and errors_other_a is filled with 0's OR
+            #    1) errors_self_b  and errors_self_a  is filled with 0's
+            # then, in the matrix multiplications between self and other would be 0
+            # and so this is wasted computation
+            b_min = a + 1
+
+            errors_other_b = inf_terms2[b_min:, :, :]  # shape: (other_error_terms_after_a, nB, embedding_size)
+            errors_self_b = inf_terms1[b_min:, :, :]  # shape: (self_error_terms_after_a, nA, embedding_size)
+
+            errors_self_a = inf_terms1[a, :, :].repeat(errors_other_b.size(0), 1, 1)  # shape: (num_repeats, nA, embedding_size)
+            errors_other_a = inf_terms2[a, :, :].repeat(errors_self_b.size(0), 1, 1)  # shape: (num_repeats, nB, embedding_size)
+
+            mixed_values1 = torch.bmm(errors_self_a, errors_other_b.transpose(1, 2))  # shape: (size1, nA, nB)
+            mixed_values2 = torch.bmm(errors_self_b, errors_other_a.transpose(1, 2))  # shape: (size2, nA, nB)
+
+            mixed_values = sum_tensor_with_different_dim0_(mixed_values1, mixed_values2)
+            new_coeffs += mixed_values.abs().sum(0)
+
+        return center, new_coeffs
+
+    def dot_product_precise_inf_inf_multiplication(self, inf_terms1: torch.Tensor, inf_terms2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Input:
+        #    inf_terms1: (n_inf_termsA, nA, embeddingSize)
+        #    inf_terms1: (n_inf_termsB, nB, embeddingSize)
+        # Output:
+        #    center: (nA, nB)
+        #    error_coeffs: (nA, nB)
+        n_inf_terms_A, nA, embedding_size = inf_terms1.shape
+        n_inf_terms_B, nB, embedding_size = inf_terms2.shape
+        min_error_terms = min(n_inf_terms_A, n_inf_terms_B)
+
+        center = torch.zeros(nA, nB, device=self.args.device)
+        new_coeffs = torch.zeros(nA, nB, device=self.args.device)
+
+        # SECTION: MIXED ERROR TERMS e_i * e_i (update bias + error coefficient of new error term)
+        # For the e_i * e_i error terms that appear when doing the multiplication, we compute the value
+        # of the center of the inverval (which we add to the bias of the new zonotope) and the error coefficients
+        # of the new error coefficient (we do abs value)
+        values_i_i = torch.bmm(
+            inf_terms1[:min_error_terms],  # (n_error_termsMin, nA, embedding_size)
+            inf_terms2[:min_error_terms].permute(0, 2, 1)  # (n_error_termsMin, embedding_size, nB)
+        )  # Output shape: (embedding_size, nA, nB)
+
+        # The value for e_i * e_i will depend on all the term of the vector, which is computed in the BMM above
+        # For the error coefficients, I need to do abs().sum() instead of the reverse, because the formula is
+        # sum_a[ abs(sum_i v_i(a) * w_i(a)) ]
+        center += 0.5 * values_i_i.sum(dim=0)
+        new_coeffs += 0.5 * values_i_i.abs().sum(dim=0)
+
+        # SECTION: MIXED ERROR TERMS e_i * e_j (compute the error coefficient of new error terms)
+        D = 20
+        for a in range(0, min_error_terms, D):
+            # there's no point in taking a in the range [min_errors + 1, last_error]
+            # because then b > min_error + 1
+            # and so either
+            #    1) errors_other_b and errors_other_a is filled with 0's OR
+            #    1) errors_self_b  and errors_self_a  is filled with 0's
+            # then, in the matrix multiplications between self and other would be 0
+            # and so this is wasted computation
+            b_min = a + 1
+
+            errors_other_b = inf_terms2[b_min:, :, :]  # shape: (other_error_terms_after_a, nB, embedding_size)
+            errors_self_b = inf_terms1[b_min:, :, :]  # shape: (self_error_terms_after_a, nA, embedding_size)
+
+            errors_self_a = inf_terms1[a:a + D, :, :].repeat(errors_other_b.size(0), 1, 1, 1)  # shape: (size1, D, nA, embedding_size)
+            errors_other_a = inf_terms2[a:a + D, :, :].repeat(errors_self_b.size(0), 1, 1, 1)  # shape: (size2, D, nB, embedding_size)
+
+            for k in range(D):
+                errors_self_a[:k, k:k+1] = 0
+                errors_other_a[:k, k:k+1] = 0
+
+            mixed_values1 = torch.matmul(errors_self_a, errors_other_b.transpose(1, 2).unsqueeze(1))  # shape: (size1, D_1, nA, nB)
+            mixed_values2 = torch.matmul(errors_self_b.unsqueeze(1), errors_other_a.transpose(2, 3))  # shape: (size2, D_2, nA, nB)
+
+            # TODO: this line is probably not correct when we reach the edges of the tensors
+            mixed_values = sum_tensor_with_different_dim0_1(mixed_values1, mixed_values2)
+            new_coeffs += mixed_values.abs().sum(dim=[0, 1])
+
+        return center, new_coeffs
 
     def dot_product_precise(self, other, zonotopes_can_have_different_number_noise_symbols=True, **kwargs) -> "Zonotope":
         # Input:
@@ -673,8 +1173,8 @@ class Zonotope:
             # The value for e_i * e_i will depend on all the term of the vector, which is computed in the BMM above
             # For the error coefficients, I need to do abs().sum() instead of the reverse, because the formula is
             # sum_a[ abs(sum_i v_i(a) * w_i(a)) ]
-            C[attention_head, 0] += 0.5 * values_i_i.sum(dim=0)  # inplace
-            half_term += 0.5 * values_i_i.abs().sum(dim=0)  # inplace
+            C[attention_head, 0] += 0.5 * values_i_i.sum(dim=0)
+            half_term += 0.5 * values_i_i.abs().sum(dim=0)
 
             # SECTION: EXISTING ERROR TERMS - Compute the new coefficients for the existing error terms
             if zonotopes_can_have_different_number_noise_symbols:
@@ -730,7 +1230,7 @@ class Zonotope:
                     mixed_values2 = torch.bmm(errors_self_b, errors_other_a.transpose(1, 2))
 
                     mixed_values = sum_tensor_with_different_dim0_(mixed_values1, mixed_values2)
-                    big_term += mixed_values.abs().sum(0)  # inplace, does not matter
+                    big_term += mixed_values.abs().sum(0)
             else:
                 for a in range(1, 1 + self.num_error_terms):
                     b_min = a + 1
@@ -746,7 +1246,23 @@ class Zonotope:
                     mixed_values2 = torch.bmm(errors_self_b, errors_other_a.transpose(1, 2))
                     mixed_values = mixed_values1 + mixed_values2
 
-                    big_term += mixed_values.abs().sum(0)  # inplace, does not matter
+                    big_term += mixed_values.abs().sum(0)
+
+            # NOTE: while unused, this implementation below shows the logic above in a clearer fashion for
+            # the case where both zonotopes have the same number of noise symbols. Useful for debugging and understanding
+            # for a in range(1, 1 + self.num_error_terms):
+            #     for b in range(a + 1, 1 + self.num_error_terms):
+            #         # a-th error terms dimensions: n_words_A * embedding_size
+            #         # b-th error terms dimensions: n_words_B * embedding_size
+            #         # output size: n_words_A * n_words_B
+            #         error_self_a = self.zonotope_w[attention_head, a, :, :]  # (nA, E)
+            #         error_other_b = other.zonotope_w[attention_head, b, :, :] # (nB, E)
+            #
+            #         error_self_b = self.zonotope_w[attention_head, b, :, :] # (nA, E)
+            #         error_other_a = other.zonotope_w[attention_head, a, :, :] # (nB, E)
+            #
+            #         result = error_self_a @ error_other_b.t()  + error_self_b @ error_other_a.t()
+            #         big_term += result.abs()
 
             new_weights = half_term + big_term
 
@@ -798,7 +1314,7 @@ class Zonotope:
             assert v1 == v2, "bad v"
             E = E1
 
-            A = self.get_width_for_special_terms(right_with_special_norm, q=dual_norm_right)  # Shape: (N2, v)
+            A = get_norm(right_with_special_norm, p=dual_norm_right, dim=0)  # Shape: (N2, v)
 
             # for the matmul, we need (N1, 1, E, v) x (N2, v, 1) -> (N1, N2, E, 1)
             left_good_shape = left.transpose(0, 1).unsqueeze(1)  # left: (E, N1, v) -> (N1, 1, E, v)
@@ -882,7 +1398,8 @@ class Zonotope:
             if A_p.size(0) > 0 and B_p.size(0) > 0:
                 assert self.p == 1 or self.p == 2, "there are 1-norm or 2-norm bound error terms but the norm is INF"
                 error_1_coeffs = multiply_matrices_p_p(A_p, B_p, self.p)  # (e_errors_1, NA, NB)
-                new_weights += self.get_width_for_special_terms(error_1_coeffs, q=dual_norm(self.p))  # inplace
+                # new_weights += get_norm(error_1_coeffs, p=dual_norm(self.p), dim=0)
+                new_weights += self.get_width_for_special_terms(error_1_coeffs, q=dual_norm(self.p))
             else:
                 assert self.p > 10, "there are no 1-norm or 2-norm bound error terms but the norm is 1 or 2"
 
@@ -910,8 +1427,8 @@ class Zonotope:
 
             ### A_p * B_inf + B_p * A_inf
             if A_p.size(0) > 0 and B_p.size(0) > 0 and A_inf.size(0) > 0 and B_inf.size(0):
-                new_weights += do_mixed_multiplication(A_inf, B_p, self.p, self.args.use_other_dot_product_ordering, inf_is_self=True)  # inplace
-                new_weights += do_mixed_multiplication(B_inf, A_p, self.p, self.args.use_other_dot_product_ordering, inf_is_self=False)  # inplace
+                new_weights += do_mixed_multiplication(A_inf, B_p, self.p, self.args.use_other_dot_product_ordering, inf_is_self=True)
+                new_weights += do_mixed_multiplication(B_inf, A_p, self.p, self.args.use_other_dot_product_ordering, inf_is_self=False)
 
             ### A_inf * B_inf
             if A_inf.size(0) > 0 and B_inf.size(0):
@@ -922,11 +1439,11 @@ class Zonotope:
                     # center_change, weights_change = self.dot_product_inf_inf_sparse_more_basic(
                     #     A_inf, B_inf
                     # )
-                    new_weights += weights_change  # inplace, does not matter
-                    C[attention_head, 0] += center_change  # inplace, does not matter
+                    new_weights += weights_change
+                    C[attention_head, 0] += center_change
                 else:
                     errors_inf_coeffs3 = multiply_matrices(A_inf, B_inf, p_right=INFINITY)  # (e_errors_inf, NA, NB)
-                    new_weights += get_norm(errors_inf_coeffs3, p=dual_norm(INFINITY), dim=0)  # inplace
+                    new_weights += get_norm(errors_inf_coeffs3, p=dual_norm(INFINITY), dim=0)
 
             start_index = 1 + self.num_error_terms + attention_head * nA * nB
             indices = torch.arange(start_index, start_index + nA * nB)
@@ -934,270 +1451,169 @@ class Zonotope:
 
         return make_zonotope_new_weights_same_args(C, source_zonotope=self, clone=False)
 
-    def dot_product_fast_batch(self, other: "Zonotope", **kwargs) -> "Zonotope":
-        if self.args.use_dot_product_variant3:
-            assert "use_dot_product_variant3 not supported yet for Zonotope.dot_product_fast_batch()"
+    # def dot_product_fast_interval(self, other: "Zonotope", **kwargs) -> Tuple["Zonotope", torch.Tensor]:
+    #     # Details for the dot product between two vectors. Here there are N1 vectors in self and N2 vectors in other, so
+    #     # the code generalizes this below
+    #     #
+    #     # Input:
+    #     #    A: (1 + n_error_terms, nA)
+    #     #    B: (1 + n_error_terms, nB)
+    #     # Output:
+    #     #    C: (1 + n_error_terms, nA, nB)
+    #     #    C[i, j] = A[i] * B[j] = A[i]_0 * B[j]_0  +
+    #     #                          + sum_k [ ( A[i]_0 * B[j]_k  +    B[j]_0 * A[i]_k )  * e_k ]
+    #     #                          + sum_k_m [ A[i]_k * B[j]_m                          * e_k * e_m)
+    #     # if not new_implementation:
+    #
+    #     if self.args.use_dot_product_variant3:
+    #         A_inf_original_all = self.zonotope_w[:, 1 + self.num_input_error_terms_special_norm:]
+    #         B_inf_original_all = other.zonotope_w[:, 1 + other.num_input_error_terms_special_norm:]
+    #
+    #     if self.num_error_terms < other.num_error_terms:
+    #         self = self.expand_error_terms_to_match_zonotope(other)
+    #         # print("Dot product: Increasing number of error terms in self")
+    #     elif other.num_error_terms < self.num_error_terms:
+    #         other = other.expand_error_terms_to_match_zonotope(self)
+    #         # print("Dot product: Increasing number of error terms in other")
+    #
+    #     assert self.zonotope_w.ndim == 4, "self should have 4 dims"
+    #     assert other.zonotope_w.ndim == 4, "other should have 4 dims"
+    #
+    #     num_attention_heads = self.zonotope_w.shape[0]
+    #     nA = self.num_words
+    #     nB = other.num_words
+    #
+    #     n_new_error_terms = num_attention_heads * nA * nB
+    #     has_error_terms = torch.ones(nA, nB, dtype=torch.bool, device=self.args.device)
+    #     C = torch.zeros(num_attention_heads, self.zonotope_w.shape[1] + n_new_error_terms, nA, nB, device=self.args.device)
+    #
+    #     def multiply_matrices(left: torch.Tensor, right_with_special_norm: torch.Tensor, p_right: float) -> torch.Tensor:
+    #         dual_norm_right = dual_norm(p_right)
+    #
+    #         E1, N1, v1 = left.shape
+    #         E2, N2, v2 = right_with_special_norm.shape
+    #         assert v1 == v2, "bad v"
+    #         E = E1
+    #
+    #         A = get_norm(right_with_special_norm, p=dual_norm_right, dim=0)  # Shape: (N2, v)
+    #
+    #         # for the matmul, we need (N1, 1, E, v) x (N2, v, 1) -> (N1, N2, E, 1)
+    #         left_good_shape = left.transpose(0, 1).unsqueeze(1)  # left: (E, N1, v) -> (N1, 1, E, v)
+    #         A_good_shape = A.unsqueeze(-1).unsqueeze(0)  # A:    (N2, v)    -> (1, N2, v, 1)
+    #
+    #         result = torch.matmul(left_good_shape.abs(), A_good_shape)  # We accumulate the intervals
+    #         assert result.shape == torch.Size([N1, N2, E, 1])
+    #
+    #         # We want to update the shape of result from (N1, N2, E, 1) to (E, N1, N2)
+    #         result_good_shape = result.squeeze(-1).permute(2, 0, 1)
+    #
+    #         assert (result_good_shape >= 0).all(), "result has some negative numbers"
+    #
+    #         return result_good_shape
+    #
+    #     interval_weights_p = torch.zeros(num_attention_heads, self.num_input_error_terms_special_norm, nA, nB, device=self.device)
+    #     for attention_head in range(num_attention_heads):
+    #         #### SECTION: A0 * B0
+    #         # First row of C[A, 0] = first vector of self x all other vector of other
+    #         # First col of C[A, 0] =   all vector of self x first vector of other
+    #         C[attention_head, 0] = self.zonotope_w[attention_head, 0] @ other.zonotope_w[attention_head, 0].t()
+    #
+    #         #### SECTION: A0 * B_errors   +     B0 * A_errors
+    #         els_A = self.zonotope_w[attention_head, 1:]  # (n_error, nA, embedding_size)
+    #         els_A_0 = self.zonotope_w[attention_head, 0].repeat(self.num_error_terms, 1, 1)  # (n_error, nA, embedding_size)
+    #
+    #         els_B = other.zonotope_w[attention_head, 1:]  # (n_error, nB, embedding_size)
+    #         els_B_0 = other.zonotope_w[attention_head, 0].repeat(self.num_error_terms, 1, 1)  # (n_error, nB, embedding_size)
+    #
+    #         sum_errors_1 = torch.bmm(els_A_0, els_B.transpose(1, 2))  # (n_error, nA, embedding_size)  bmm  (n_error, embedding_size, nB)
+    #         sum_errors_2 = torch.bmm(els_A, els_B_0.transpose(1, 2))  # (n_error, nA, embedding_size)  bmm  (n_error, embedding_size, nB)
+    #         C[attention_head, 1:1+self.num_error_terms] = sum_errors_1 + sum_errors_2  # (num_error_terms, nA, nB)
+    #
+    #         #### SECTION: A_errors * B_errors
+    #         #
+    #         # We will decompose the errors into two groups: E_p and E_inf
+    #         # where E_p contains the error terms bounded by the 1-norm or 2-norm and E_inf contains the error terms bounded by the inf-norm
+    #         #
+    #         # Therefore,
+    #         #      A_errors = A_p + A_inf
+    #         #      B_errors = B_p + B_inf
+    #         # and
+    #         #      A_errors * B_errors = (A_p + A_inf) * (B_p + B_inf)
+    #         #                          = A_p * B_p  + A_p * B_inf + B_p * A_inf +  A_inf * B_inf
+    #         A_p, A_inf = self.get_input_special_errors_and_new_error_terms(self.zonotope_w[attention_head, 1:])  # (E_p, N1, v)
+    #         B_p, B_inf = other.get_input_special_errors_and_new_error_terms(other.zonotope_w[attention_head, 1:]) # (E_inf, N2, v)
+    #
+    #         assert A_p.size(0) == B_p.size(0), "A and B don't have the same number of non-inf error terms"
+    #         assert A_inf.size(0) == B_inf.size(0), "A and B don't have the same number of inf error terms"
+    #         assert A_p.size(2) == B_p.size(2), "A and B don't have the same number of elements in the vectors - p"
+    #         assert A_inf.size(2) == B_inf.size(2), "A and B don't have the same number of elements in the vectors - inf"
+    #         assert self.p == other.p, "Self and other don't have the same norm"
+    #
+    #         new_weights = torch.zeros(nA, nB, device=self.device)
+    #
+    #         assert A_p.size(0) == B_p.size(0), "Mismatch in num of lp noise symbols between two zonotopes"
+    #
+    #
+    #         ### A_p * B_p
+    #         if A_p.size(0) > 0 and B_p.size(0) > 0:
+    #             assert self.p == 1 or self.p == 2, "there are 1-norm or 2-norm bound error terms but the norm is INF"
+    #             interval_weights_p[attention_head] += multiply_matrices(A_p, right_with_special_norm=B_p, p_right=self.p)  # (e_errors_1, NA, NB)
+    #         else:
+    #             assert self.p > 10, "there are no 1-norm or 2-norm bound error terms but the norm is 1 or 2"
+    #
+    #         def do_mixed_multiplication(inf_errors: torch.Tensor, p_errors: torch.Tensor, p: float, inf_is_self: bool):
+    #             errors_inf_coeffs1_v2 = multiply_matrices(p_errors, right_with_special_norm=inf_errors, p_right=INFINITY)  # (e_error_1, NB, NA)
+    #             if inf_is_self:
+    #                 errors_inf_coeffs1_v2 = errors_inf_coeffs1_v2.permute(0, 2, 1)
+    #             return errors_inf_coeffs1_v2
+    #
+    #         ### A_p * B_inf + B_p * A_inf
+    #         if A_p.size(0) > 0 and B_p.size(0) > 0 and A_inf.size(0) > 0 and B_inf.size(0):
+    #             interval_weights_p[attention_head] += do_mixed_multiplication(A_inf, B_p, self.p, inf_is_self=True)
+    #             interval_weights_p[attention_head] += do_mixed_multiplication(B_inf, A_p, self.p, inf_is_self=False)
+    #
+    #         ### A_inf * B_inf
+    #         if A_inf.size(0) > 0 and B_inf.size(0):
+    #             if self.args.use_dot_product_variant3:
+    #                 center_change, weights_change = self.dot_product_precise_inf_inf_multiplicationv1(
+    #                     A_inf_original_all[attention_head], B_inf_original_all[attention_head]
+    #                 )
+    #                 # center_change, weights_change = self.dot_product_inf_inf_sparse_more_basic(
+    #                 #     A_inf, B_inf
+    #                 # )
+    #                 new_weights += weights_change
+    #                 C[attention_head, 0] += center_change
+    #             else:
+    #                 errors_inf_coeffs3 = multiply_matrices(A_inf, B_inf, p_right=INFINITY)  # (e_errors_inf, NA, NB)
+    #                 new_weights += get_norm(errors_inf_coeffs3, p=dual_norm(INFINITY), dim=0)
+    #
+    #         start_index = 1 + self.num_error_terms + attention_head * nA * nB
+    #         indices = torch.arange(start_index, start_index + nA * nB)
+    #         C[attention_head, indices, has_error_terms] = new_weights[has_error_terms]
+    #
+    #     return make_zonotope_new_weights_same_args(C, source_zonotope=self, clone=False), interval_weights_p
 
-        assert self.args.perturbed_words == 1, "Multiple perturbed words not supported yet for Zonotope.dot_product_fast_batch()"
-
-        if self.num_error_terms < other.num_error_terms:
-            self = self.expand_error_terms_to_match_zonotope(other)
-        elif other.num_error_terms < self.num_error_terms:
-            other = other.expand_error_terms_to_match_zonotope(self)
-
-        assert self.zonotope_w.ndim == 4, "self should have 4 dims"
-        assert other.zonotope_w.ndim == 4, "other should have 4 dims"
-
-        num_attention_heads = self.zonotope_w.shape[0]
-        nA = self.num_words
-        nB = other.num_words
-
-        n_new_error_terms = num_attention_heads * nA * nB
-        C = torch.zeros(num_attention_heads, self.zonotope_w.shape[1] + n_new_error_terms, nA, nB, device=self.args.device)
-
-        def multiply_matrices(left: torch.Tensor, right_with_special_norm: torch.Tensor, p_right: float) -> torch.Tensor:
-            dual_norm_right = dual_norm(p_right)
-
-            _, E1, N1, v1 = left.shape
-            _, E2, N2, v2 = right_with_special_norm.shape
-            assert v1 == v2, "bad v"
-            E = E1
-
-            A = get_norm(right_with_special_norm, p=dual_norm_right, dim=1)  # Shape: (A, N2, v)
-
-            # for the matmul, we need (A, N1, 1, E, v) x (A, N2, v, 1) -> (A, N1, N2, E, 1)
-            left_good_shape = left.transpose(1, 2).unsqueeze(2)  # left: (A, E, N1, v) -> (A, N1, 1, E, v)
-            A_good_shape = A.unsqueeze(-1).unsqueeze(1)  # A:    (A, N2, v)    -> (A, 1, N2, v, 1)
-
-            result = torch.matmul(left_good_shape.abs(), A_good_shape)  # We accumulate the intervals
-            assert result.shape == torch.Size([num_attention_heads, N1, N2, E, 1])
-
-            # We want to update the shape of result from (A, N1, N2, E, 1) to (A, E, N1, N2)
-            result_good_shape = result.squeeze(-1).permute(0, 3, 1, 2)
-
-            assert (result_good_shape >= 0).all(), "result has some negative numbers"
-
-            return result_good_shape
-
-        def multiply_matrices_p_p(left: torch.Tensor, right: torch.Tensor, p: float) -> torch.Tensor:
-            q = dual_norm(p)
-            _, E1, N1, v1 = left.shape
-            _, E2, N2, v2 = right.shape
-            assert v1 == v2, "bad v"
-            E = E1
-
-            A = get_norm(right, q, dim=1)  # Shape: (A, N2, v)
-
-            # for the matmul, we need (A, N1, 1, E, v) x (A, N2, v, 1) -> (A, N1, N2, E, 1)
-            left_good_shape = left.transpose(1, 2).unsqueeze(2)  # left: (A, E, N1, v) -> (A, N1, 1, E, v)
-            A_good_shape = A.unsqueeze(-1).unsqueeze(1)  # A:    (A, N2, v)    -> (A, 1, N2, v, 1)
-
-            result = torch.matmul(left_good_shape.abs(), A_good_shape)  # We accumulate the intervals
-            assert result.shape == torch.Size([num_attention_heads, N1, N2, E, 1])
-
-            # We want to update the shape of result from (A, N1, N2, E, 1) to (A, E, N1, N2)
-            result_good_shape = result.squeeze(-1).permute(0, 3, 1, 2)
-
-            assert (result_good_shape >= 0).all(), "result has some negative numbers"
-
-            return result_good_shape
-
-        #### SECTION: A0 * B0
-        # First row of C[A, 0] = first vector of self x all other vector of other
-        # First col of C[A, 0] =   all vector of self x first vector of other
-        C[:, 0] = torch.bmm(self.zonotope_w[:, 0], other.zonotope_w[:, 0].transpose(1, 2))
-
-        #### SECTION: A0 * B_errors   +     B0 * A_errors
-        els_A = self.zonotope_w[:, 1:]  # (A, n_error, nA, embedding_size)
-        els_A_0 = self.zonotope_w[:, 0:1].repeat(1, self.num_error_terms, 1, 1)  # (A, n_error, nA, embedding_size)
-
-        els_B = other.zonotope_w[:, 1:]  # (A, n_error, nB, embedding_size)
-        els_B_0 = other.zonotope_w[:, 0:1].repeat(1, self.num_error_terms, 1, 1)  # (A, n_error, nB, embedding_size)
-
-        sum_errors_1 = torch.matmul(els_A_0, els_B.transpose(2, 3))  # (A, n_error, nA, embedding_size)  matmul  (A, n_error, embedding_size, nB)
-        sum_errors_2 = torch.matmul(els_A, els_B_0.transpose(2, 3))  # (A, n_error, nA, embedding_size)  matmul  (A, n_error, embedding_size, nB)
-        C[:, 1:1+self.num_error_terms] = sum_errors_1 + sum_errors_2  # (A, num_error_terms, nA, nB)
-
-        #### SECTION: A_errors * B_errors
-        #
-        # We will decompose the errors into two groups: E_p and E_inf
-        # where E_p contains the error terms bounded by the 1-norm or 2-norm and E_inf contains the error terms bounded by the inf-norm
-        #
-        # Therefore,
-        #      A_errors = A_p + A_inf
-        #      B_errors = B_p + B_inf
-        # and
-        #      A_errors * B_errors = (A_p + A_inf) * (B_p + B_inf)
-        #                          = A_p * B_p  + A_p * B_inf + B_p * A_inf +  A_inf * B_inf
-        A_p, A_inf = self.get_input_special_errors_and_new_error_terms(self.zonotope_w[:, 1:])  # (A, E_p, N1, v)
-        B_p, B_inf = other.get_input_special_errors_and_new_error_terms(other.zonotope_w[:, 1:])  # (A, E_inf, N2, v)
-
-        assert A_p.size(1) == B_p.size(1), "A and B don't have the same number of non-inf error terms"
-        assert A_inf.size(1) == B_inf.size(1), "A and B don't have the same number of inf error terms"
-        assert A_p.size(3) == B_p.size(3), "A and B don't have the same number of elements in the vectors - p"
-        assert A_inf.size(3) == B_inf.size(3), "A and B don't have the same number of elements in the vectors - inf"
-        assert self.p == other.p, "Self and other don't have the same norm"
-
-        new_weights = torch.zeros(num_attention_heads, nA, nB, device=self.device)
-
-        ### A_p * B_p
-        # TODO(multi noise symbol groups): adapt
-        if A_p.size(1) > 0 and B_p.size(1) > 0:
-            assert self.p == 1 or self.p == 2, "there are 1-norm or 2-norm bound error terms but the norm is INF"
-            error_1_coeffs = multiply_matrices_p_p(A_p, B_p, self.p)  # (A, e_errors_1, NA, NB)
-            new_weights += get_norm(error_1_coeffs, p=dual_norm(self.p), dim=1)  # inplace
-        else:
-            assert self.p > 10, "there are no 1-norm or 2-norm bound error terms but the norm is 1 or 2"
-
-        def do_mixed_multiplication(inf_errors: torch.Tensor, p_errors: torch.Tensor, p: float, use_other_dot_product_ordering: bool, inf_is_self: bool):
-            assert not use_other_dot_product_ordering, "use_other_dot_product_ordering not supported yet"
-            errors_inf_coeffs1_v2 = multiply_matrices(
-                p_errors, right_with_special_norm=inf_errors, p_right=INFINITY
-            )  # (A, e_error_1, NB, NA)
-
-            # (A, NB, NA)
-            result_v2 = get_norm(errors_inf_coeffs1_v2, p=dual_norm(p), dim=1)
-
-            if inf_is_self:
-                result_v2 = result_v2.transpose(1, 2)   # (A, NA, NB)
-            assert (result_v2 >= 0).all(), "v2"
-            return result_v2
-
-        ### A_p * B_inf + B_p * A_inf
-        if A_p.size(1) > 0 and B_p.size(1) > 0 and A_inf.size(1) > 0 and B_inf.size(1):
-            new_weights += do_mixed_multiplication(A_inf, B_p, self.p, self.args.use_other_dot_product_ordering, inf_is_self=True)  # inplace
-            new_weights += do_mixed_multiplication(B_inf, A_p, self.p, self.args.use_other_dot_product_ordering, inf_is_self=False)  # inplace
-
-        ### A_inf * B_inf
-        if A_inf.size(1) > 0 and B_inf.size(1):
-            errors_inf_coeffs3 = multiply_matrices(A_inf, B_inf, p_right=INFINITY)  # (A, e_errors_inf, NA, NB)
-            new_weights += get_norm(errors_inf_coeffs3, p=dual_norm(INFINITY), dim=1)  # inplace
-
-        # num_old_errors = 1 + self.num_error_terms
-        # all_attention_heads = torch.ones(num_attention_heads, dtype=torch.bool, device=self.args.device)
-        # has_error_terms = torch.ones(nA, nB, dtype=torch.bool, device=self.args.device)
-        # indices = torch.arange(num_old_errors, num_old_errors + num_attention_heads * nA * nB)
-        # C[all_attention_heads, indices, has_error_terms] = new_weights[all_attention_heads, has_error_terms]
-
-        has_error_terms = torch.ones(nA, nB, dtype=torch.bool, device=self.args.device)
-        for attention_head in range(num_attention_heads):
-            start_index = 1 + self.num_error_terms + attention_head * nA * nB
-            indices = torch.arange(start_index, start_index + nA * nB)
-            C[attention_head, indices, has_error_terms] = new_weights[attention_head, has_error_terms]
-
-        return make_zonotope_new_weights_same_args(C, source_zonotope=self, clone=False)
-
-    def do_multiply(self, other: "Zonotope", **kwargs) -> "Zonotope":
-        if self.args.use_dot_product_variant3:
-            assert "use_dot_product_variant3 not supported yet for Zonotope.do_multiply()"
-        assert not self.args.use_other_dot_product_ordering, "use_other_dot_product_ordering not supported yet"
-
-        assert self.args.perturbed_words == 1, "Multiple perturbed words not supported yet for Zonotope.dot_product_fast_batch()"
-
-        if self.num_error_terms < other.num_error_terms:
-            self = self.expand_error_terms_to_match_zonotope(other)
-        elif other.num_error_terms < self.num_error_terms:
-            other = other.expand_error_terms_to_match_zonotope(self)
-
-        assert self.zonotope_w.ndim == 3, "self should have 4 dims"
-        assert other.zonotope_w.ndim == 3, "other should have 4 dims"
-        assert self.zonotope_w.shape[1] == other.zonotope_w.shape[1], "Dim 1 doesn't match"
-        assert self.zonotope_w.shape[2] == other.zonotope_w.shape[2], "Dim 2 doesn't match"
-
-        _, nA, nB = self.zonotope_w.shape
-
-        n_new_error_terms = nA * nB
-        C = torch.zeros(self.zonotope_w.shape[0] + n_new_error_terms, nA, nB, device=self.args.device)
-
-        def multiply_matrices(left: torch.Tensor, right_with_special_norm: torch.Tensor, p_right: float) -> torch.Tensor:
-            dual_norm_right = dual_norm(p_right)
-            assert left.shape[1:] == right_with_special_norm.shape[1:], "Incorrect shape"
-            E1, N1, N2 = left.shape
-
-            A = get_norm(right_with_special_norm, p=dual_norm_right, dim=0)  # Shape: (N1, N2)
-
-            # (E1, N1, N2) * (N1, N2) = (E1, N1, N2)
-            result = left.abs() * A
-
-            assert result.shape == torch.Size([E1, N1, N2]), "Incorrect shape"
-            assert (result >= 0).all(), "result has some negative numbers"
-
-            return result
-
-        def multiply_matrices_p_p(left: torch.Tensor, right: torch.Tensor, p: float) -> torch.Tensor:
-            return multiply_matrices(left, right, p)
-
-        #### SECTION: A0 * B0
-        C[0] = self.zonotope_w[0] * other.zonotope_w[0]
-
-        #### SECTION: A0 * B_errors   +     B0 * A_errors
-        els_A = self.zonotope_w[1:]  # (n_error, nA, nB)
-        els_A_0 = self.zonotope_w[0:1].repeat(self.num_error_terms, 1, 1)  # (n_error, nA, nB)
-
-        els_B = other.zonotope_w[1:]  # (n_error, nA, nB)
-        els_B_0 = other.zonotope_w[0:1].repeat(self.num_error_terms, 1, 1)  # (n_error, nA, nB)
-
-        sum_errors_1 = els_A_0 * els_B  # (n_error, nA, nB) * (n_error, nA, nB)
-        sum_errors_2 = els_B_0 * els_A  # (n_error, nA, nB) * (n_error, nB, nB)
-        C[1:1+self.num_error_terms] = sum_errors_1 + sum_errors_2  # (A, num_error_terms, nA, nB)
-
-        #### SECTION: A_errors * B_errors
-        #
-        # We will decompose the errors into two groups: E_p and E_inf
-        # where E_p contains the error terms bounded by the 1-norm or 2-norm and E_inf contains the error terms bounded by the inf-norm
-        #
-        # Therefore,
-        #      A_errors = A_p + A_inf
-        #      B_errors = B_p + B_inf
-        # and
-        #      A_errors * B_errors = (A_p + A_inf) * (B_p + B_inf)
-        #                          = A_p * B_p  + A_p * B_inf + B_p * A_inf +  A_inf * B_inf
-        A_p, A_inf = self.get_input_special_errors_and_new_error_terms(self.zonotope_w[1:])  # (E_p, N1, v)
-        B_p, B_inf = other.get_input_special_errors_and_new_error_terms(other.zonotope_w[1:])  # (E_inf, N2, v)
-
-        assert A_p.size(0) == B_p.size(0), "A and B don't have the same number of non-inf error terms"
-        assert A_inf.size(0) == B_inf.size(0), "A and B don't have the same number of inf error terms"
-        assert A_p.size(2) == B_p.size(2), "A and B don't have the same number of elements in the vectors - p"
-        assert A_inf.size(2) == B_inf.size(2), "A and B don't have the same number of elements in the vectors - inf"
-        assert self.p == other.p, "Self and other don't have the same norm"
-
-        new_weights = torch.zeros(nA, nB, device=self.device)
-
-        ### A_p * B_p
-        # TODO(multi noise symbol groups): adapt
-        if A_p.size(0) > 0 and B_p.size(0) > 0:
-            assert self.p == 1 or self.p == 2, "there are 1-norm or 2-norm bound error terms but the norm is INF"
-            error_1_coeffs = multiply_matrices_p_p(A_p, B_p, self.p)  # (e_errors_1, nA, nB)
-            new_weights += get_norm(error_1_coeffs, p=dual_norm(self.p), dim=0)  # inplace, does not matter for now
-        else:
-            assert self.p > 10, "there are no 1-norm or 2-norm bound error terms but the norm is 1 or 2"
-
-        def do_mixed_multiplication(inf_errors: torch.Tensor, p_errors: torch.Tensor, p: float):
-            errors_inf_coeffs1 = multiply_matrices(
-                p_errors, right_with_special_norm=inf_errors, p_right=INFINITY
-            )  # (e_error_1, NA, NB)
-
-            # (NA, NB)
-            result = get_norm(errors_inf_coeffs1, p=dual_norm(p), dim=0)
-            assert (result >= 0).all(), "v2"
-            return result
-
-        ### A_p * B_inf + B_p * A_inf
-        if A_p.size(0) > 0 and B_p.size(0) > 0 and A_inf.size(0) > 0 and B_inf.size(0):
-            new_weights += do_mixed_multiplication(A_inf, B_p, self.p)  # inplace, does not matter for now
-            new_weights += do_mixed_multiplication(B_inf, A_p, self.p)  # inplace, does not matter for now
-
-        ### A_inf * B_inf
-        if A_inf.size(0) > 0 and B_inf.size(0):
-            errors_inf_coeffs3 = multiply_matrices(A_inf, B_inf, p_right=INFINITY)  # (e_errors_inf, NA, NB)
-            new_weights += get_norm(errors_inf_coeffs3, p=dual_norm(INFINITY), dim=0)  # inplace, does not matter for now
-
-        num_old_errors = 1 + self.num_error_terms
-        has_error_terms = torch.ones(nA, nB, dtype=torch.bool, device=self.args.device)
-        indices = torch.arange(num_old_errors, num_old_errors + nA * nB)
-        C[indices, has_error_terms] = new_weights[has_error_terms]
-
-        return make_zonotope_new_weights_same_args(C, source_zonotope=self, clone=False)
+    # def dot_product_inf_inf_sparse_more_basic(self, inf_terms1: torch.Tensor, inf_terms2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     nA = inf_terms1.size(1)
+    #     nB = inf_terms2.size(1)
+    #
+    #     # SECTION: MIXED ERROR TERMS e_i * e_j (compute the error coefficient of new error terms)
+    #     # (N1, 1, E, w) x (1, N2, w, E) = (N1, N2, E, E) -> abs -> sum(dim=[-1, -2]) = (N1, N2)
+    #     left = inf_terms1  # shape (E, N1, w)
+    #     right = inf_terms2  # shape (E, N2, w)
+    #
+    #     left_good_shape = left.transpose(0, 1).unsqueeze(1).to_sparse()  # shape (N1, 1, E, w)
+    #     right_good_shape = right.permute(1, 2, 0).unsqueeze(0).to_sparse()  # shape (1, N2, w, E)
+    #
+    #     indexC, valueC = spspmm(left_good_shape.indices(), left_good_shape.values(),
+    #                             right_good_shape.indices(), right_good_shape.values(),
+    #                             m=3, k=3, n=2)
+    #
+    #     new_weights = torch.matmul(left_good_shape, right_good_shape)
+    #     new_weights = new_weights.abs().sum(dim=[-1, -2])
+    #
+    #     new_weights = new_weights.to_dense()
+    #     return torch.zeros_like(new_weights), new_weights
 
     def divide(self, W: "Zonotope", use_original_reciprocal=True, y_positive_constraint=False) -> "Zonotope":
         if type(W) == Zonotope:
@@ -1350,12 +1766,12 @@ class Zonotope:
         # NEW_CONSTS = 0.5 * (t_opt.exp() - lambdas * t_opt - lambdas * u)
         # NEW_CONSTS = 0.5 * (t_opt.exp() - lambdas * (t_opt + u))
         NEW_CONSTS = 0.5 * (lambdas * (1 - t_opt - u))
-        NEW_CONSTS += 0.5 * u.exp()  # inplace
+        NEW_CONSTS += 0.5 * u.exp()
 
         # NEW_COEFFS = 0.5 * (lambdas * t_opt - t_opt.exp() - lambdas * u)
         # NEW_COEFFS = 0.5 * (- t_opt.exp() + lambdas * (t_opt  - u))
         NEW_COEFFS = 0.5 * (lambdas * (t_opt  - u - 1))
-        NEW_COEFFS += 0.5 * u.exp()  # inplace
+        NEW_COEFFS += 0.5 * u.exp()
 
         INTERCEPT = (t_opt.exp() - lambdas * t_opt)
         if not ((NEW_CONSTS - INTERCEPT)[different_bool] >= -1e-4).all():
@@ -1375,12 +1791,11 @@ class Zonotope:
             transformed_x = self.zonotope_w
 
             # Center
-            transformed_x[0] *= lambdas  # inplace
-            transformed_x[0] += NEW_CONSTS  # inplace
+            transformed_x[0] *= lambdas
+            transformed_x[0] += NEW_CONSTS
             transformed_x[0, equal_bool] = l[equal_bool].exp()
 
             # transformed_x[1:1 + self.num_error_terms] = self.zonotope_w[1:]  # Copy everthing
-            # inplace
             transformed_x[1:, equal_bool] = 0.0  # But set the error terms of the exact values (l = u) to 0
             transformed_x[1:] *= lambdas  # Then multiply by lambda. This basically multiplies everything by lambda
 
@@ -1392,9 +1807,7 @@ class Zonotope:
             # Step 1) new bias
             # for the equality case, we put the value 1/x
             # for the difference case, we put the center λ a0 + (T + B)/2
-            # inplace
             transformed_x[0] = lambdas * self.zonotope_w[0] + NEW_CONSTS
-            # inplace
             transformed_x[0, equal_bool] = l[equal_bool].exp()
 
             # Step 2) updated error weights
@@ -1403,11 +1816,8 @@ class Zonotope:
             import gc; gc.collect(); torch.cuda.empty_cache()
 
             # This is done this way to avoid creating unneeded tensors, which blow up the memory requirement
-            # inplace
             transformed_x[1:1 + self.num_error_terms] = self.zonotope_w[1:]  # Copy everthing
-            # inplace
             transformed_x[1:1 + self.num_error_terms, equal_bool] = 0.0      # But set the error terms of the exact values (l = u) to 0
-            # inplace
             transformed_x[1:1 + self.num_error_terms] *= lambdas             # Then multiply by lambda. This basically multiplies everything by lambda
 
             # Step 3) new error weights
@@ -1430,7 +1840,6 @@ class Zonotope:
             # If we did transformed_x[num_error_terms:num_error_terms + n_new_error_terms, has_new_error_term]
             # then it would do a cross product, i.e. indices X has_new_error_term
             indices = torch.arange(1 + self.num_error_terms, 1 + self.num_error_terms + n_new_error_terms)
-            # inplace
             transformed_x[indices, has_new_error_term] = NEW_COEFFS[different_bool]
 
             return make_zonotope_new_weights_same_args(transformed_x, source_zonotope=self, clone=False)
@@ -1544,9 +1953,7 @@ class Zonotope:
                 sum_w_list, new_error_terms_collapsed_list = [], []
                 for a in range(A):
                     sum_exp_diffs_w, new_error_terms_collapsed = process_values(
-                        self.zonotope_w[a:a+1], self, A=1, num_rows=num_rows, num_values=num_values,
-                        keep_intermediate_zonotopes=self.args.keep_intermediate_zonotopes
-                    )
+                        self.zonotope_w[a:a+1], self, A=1, num_rows=num_rows, num_values=num_values)
                     sum_w_list.append(sum_exp_diffs_w)
                     new_error_terms_collapsed_list.append(new_error_terms_collapsed)
                     cleanup_memory()
@@ -1554,10 +1961,7 @@ class Zonotope:
                 sum_exp_diffs_w = torch.cat(sum_w_list, dim=0)
                 new_error_terms_collapsed = torch.cat(new_error_terms_collapsed_list, dim=0)
             else:
-                sum_exp_diffs_w, new_error_terms_collapsed = process_values(
-                    self.zonotope_w, self, A, num_rows, num_values,
-                    keep_intermediate_zonotopes=self.args.keep_intermediate_zonotopes
-                )
+                sum_exp_diffs_w, new_error_terms_collapsed = process_values(self.zonotope_w, self, A, num_rows, num_values)
 
             # (A * num_rows * num_values, A, num_rows, num_values)
             new_error_terms_collapsed_intermediate_shape = torch.zeros(A * num_rows * num_values, A, num_rows, num_values, device=self.device)
@@ -1567,10 +1971,8 @@ class Zonotope:
 
             # (A, A * num_rows * num_values, num_rows, num_values)
             new_error_terms_collapsed_good_shape = new_error_terms_collapsed_intermediate_shape.permute(1, 0, 2, 3)
-
-            if not self.args.keep_intermediate_zonotopes:
-                del new_error_terms_collapsed_intermediate_shape
-                cleanup_memory()
+            del new_error_terms_collapsed_intermediate_shape
+            cleanup_memory()
 
             # (A, error dims that existed before exp, num_rows, num_values)
             final_sum_exps_zonotope_w = torch.cat([sum_exp_diffs_w, new_error_terms_collapsed_good_shape], dim=1)
@@ -1616,6 +2018,53 @@ class Zonotope:
 
         zonotope_softmax_sum_constrained = zonotope_softmax.add_equality_constraint_on_softmax()
         return zonotope_softmax_sum_constrained
+
+        # l, u = zonotope_softmax_sum_constrained.concretize()
+        # if (l < 0).any() or (u > 1).any():
+        #     # Input Shape: (A, 1 + num_error_terms, num_softmaxes, num_softmaxes)
+        #     # Equation shape: (A * num_softmaxes * num_softmaxes, 1 + num_error_terms)
+        #
+        #     zonotope_softmax_range_and_sum_constrained = zonotope_softmax_sum_constrained.add_0_1_range_constraint()
+        # else:
+        #     zonotope_softmax_range_and_sum_constrained = zonotope_softmax_sum_constrained
+        #
+        # l, u = zonotope_softmax_constrained.concretize()
+        # assert (l > 0).all(), "Softmax: Softmax result post-constraint isn't positive (min l = %f)" % l.min()
+        #
+        # return zonotope_softmax_range_and_sum_constrained
+
+    # def add_0_1_range_constraint(self) -> "Zonotope":
+    #     # Input Shape: (A, 1 + num_error_terms, num_rows, num_values)
+    #     # Equation shape: (A * num_rows * num_values, 1 + num_error_terms)
+    #     expressions = self.zonotope_w.permute(0, 2, 3, 1).reshape(-1, 1 + self.num_error_terms)
+    #
+    #     use_lp_solver = True
+    #     if use_lp_solver:
+    #         current_error_range_low, current_error_range_high = self.error_term_range_low, self.error_term_range_high
+    #         if current_error_range_low is None:
+    #             current_error_range_low = -torch.ones(self.num_error_terms, device=self.device)
+    #             current_error_range_high = torch.ones(self.num_error_terms, device=self.device)
+    #
+    #         # First equation: x >= 0  or in other words -x <= 0
+    #         non_negative = -expressions
+    #         # Second equation: x <= 1 or in other words x - 1 <= 0
+    #         not_bigger_than_one = expressions.clone()
+    #         not_bigger_than_one[:, 0] -= 1
+    #
+    #         expressions_less_or_equal_to_zero = torch.cat([non_negative, not_bigger_than_one])
+    #
+    #         new_error_ranges_low, new_error_ranges_high = get_updated_error_ranges_using_LP(
+    #             expressions_less_or_equal_to_zero, current_error_range_low, current_error_range_high,
+    #             timeout=self.args.timeout, num_processes=self.args.num_processes,
+    #         )
+    #     else:
+    #         new_error_ranges_low, new_error_ranges_high = add_inequality_constraints(
+    #             expressions, source_zonotope=self, lower_bound=0.0, upper_bound=1.0
+    #         )
+    #
+    #     new_zonotope = self.clone()
+    #     new_zonotope.set_error_term_ranges(new_error_ranges_low, new_error_ranges_high)
+    #     return new_zonotope
 
     def add_equality_constraint_on_softmax(self) -> "Zonotope":
         # The shape of the softmax will be (1 + num error terms, num_words, num_words)
@@ -1684,7 +2133,7 @@ class Zonotope:
         # LHS: (num_error_terms, A * num_softmaxes)    RHS: (num_error_terms, A * num_rows, 1) -> (num_error_terms, A * num_rows)
         new_weights[:, equations_to_fix, 0] = resulting_zonotope.zonotope_w.squeeze(2)
         # Shape of changed elements: (num_error_terms, A * num_rows, num_softmaxes - 1)
-        new_weights[:, equations_to_fix, 1:] += change_other_vars_due_to_substitution  # inplace, does not matter for now
+        new_weights[:, equations_to_fix, 1:] += change_other_vars_due_to_substitution
 
         # Before: (num_error_terms, A * num_rows, num_softmaxes)     After:  (num_error_terms, A, num_rows, num_softmaxes)
         new_weights_right_shape = new_weights.reshape(new_weights.size(0), A, num_rows, num_softmaxes)
@@ -1694,11 +2143,7 @@ class Zonotope:
         return make_zonotope_new_weights_same_args(new_weights_right_shape, source_zonotope=resulting_zonotope, clone=False)
 
     def dense(self, dense) -> "Zonotope":
-        result = self.matmul(dense.weight)
-        if dense.bias is None:
-            return result
-        else:
-            return result.add(dense.bias)
+        return self.matmul(dense.weight).add(dense.bias)
 
     def tanh(self) -> "Zonotope":
         lower, upper = self.concretize()
@@ -1716,8 +2161,6 @@ class Zonotope:
         shape = list(self.zonotope_w.shape)
         shape[0] += n_new_error_terms
         transformed_x = torch.zeros(shape, device=self.args.device)
-
-        # print("tanh shape", transformed_x.shape)
 
         # Step 2: put bias, old weights, new weights
         lambda_optimal = torch.min(1 - tanh(lower).square(), 1 - tanh(upper).square())
@@ -1742,90 +2185,10 @@ class Zonotope:
         w_avg = torch.ones((dim_out, dim_out), device=self.device) / dim_out  # avg per = sum followed by division
         zonotope_minus_avg = self.add(self.matmul(w_avg).multiply(-1.))
 
-        if layer_norm == "standard":
-            variance = zonotope_minus_avg.square_and_sum_and_repeat().multiply(1 / dim_out)
-            # variance = zonotope_minus_avg.multiply(zonotope_minus_avg).matmul(w_avg)
-            sqrt = variance.add(epsilon).sqrt()
-            normalized = zonotope_minus_avg.divide(sqrt)
-        elif layer_norm == "no_var":
-            normalized = zonotope_minus_avg
-        else:
-            raise ValueError(f"Unknown layer norm mode '{layer_norm}'")
-
+        assert layer_norm == "no_var", "Zonotope implementation currently only supports 'no-var' layer normalization"
+        normalized = zonotope_minus_avg
         normalized = normalized.multiply(normalizer.weight).add(normalizer.bias)
         return normalized
-
-    def square_and_sum_and_repeat(self) -> "Zonotope":
-        # input: (1 + #error, length, E)
-        # output: (1 + #error, length, E)
-        assert self.zonotope_w.ndim == 3, "Expected 3-Dim zonotope weights"
-        E = self.zonotope_w.shape[-1]
-
-        # (1 + #error, length, E) -> (1, 1 + #error, length, E) -> (length, 1 + #error, 1, E)
-        zonotope_w_reshaped = self.zonotope_w.unsqueeze(0).transpose(0, 2)
-        zonotope_reshaped = make_zonotope_new_weights_same_args(zonotope_w_reshaped, self, clone=False)
-
-        # (length, 1 + #error + #new error, 1, 1)
-        result = zonotope_reshaped.dot_product_fast(zonotope_reshaped)
-        # result = zonotope_reshaped.dot_product_fast_batch(zonotope_reshaped)
-
-        assert result.zonotope_w.ndim == 4
-        assert result.zonotope_w.shape[-1] == 1
-        assert result.zonotope_w.shape[-2] == 1
-
-        # (length, 1 + new #errors, 1, 1) -> (1, 1 + new #errors, length, 1) -> (1 + new #errors, length, 1)
-        result_w = result.zonotope_w.transpose(0, 2).squeeze(0)
-        result_w_repeated = result_w.repeat((1, 1, E))  # (1 + new #errors, length, E)
-        return make_zonotope_new_weights_same_args(result_w_repeated, result, clone=False)
-
-    def sqrt(self) -> "Zonotope":
-        l, u = self.concretize()
-
-        if torch.min(l) <= epsilon:
-            num_negative_elements = (l <= epsilon).float().sum().item()
-            num_elements = l.nelement()
-
-            message = "sqrt: Bounds must be positive but %d elements out of %d were < 1e-12 (min value = %.12f, iszero = %s)" % (
-                num_negative_elements, num_elements, torch.min(l).item(), torch.min(l).item() == 0)
-            assert False, message
-
-        different_bool = has_new_error_term = (l != u)
-        equal_bool = (l == u)
-
-        # Final step: creating the new weight matrix
-        n_new_error_terms = int(torch.sum(different_bool).item())
-
-        # Step 1: Create the zonotope weight of the right size
-        shape = list(self.zonotope_w.shape)
-        shape[0] += n_new_error_terms
-        transformed_x = torch.zeros(shape, device=self.args.device)
-
-        # Step 2: Finding t_crit
-
-        # f(x) = sqrt(x)      therefore      f'(x) = 1 / (2 * sqrt(x))
-        # f'(t_crit) = (sqrt(u) - sqrt(l)) / (u - l) = A
-        # 1 / (2 * sqrt(t_crit)) = A
-        # sqrt(t_crit) = 1/(2A) = (u - l) / (2 * (sqrt(u) - sqrt(l)))    <-  careful here with divisions
-        t_crit = ((u - l) / (2 * (u.sqrt() - l.sqrt()))).square()
-
-        def f(x):
-            return x.sqrt()
-
-        # Step 3: put bias, old weights, new weights
-        lambda_optimal = (f(u) - f(l)) / (u - l)  # lambda = f'(t_crit) = (sqrt(u) - sqrt(l)) / (u - l)
-        X = f(l) - lambda_optimal * l
-        new_consts = 0.5 * (f(t_crit)               - lambda_optimal * t_crit  + X)
-        new_coeffs = 0.5 * (lambda_optimal * t_crit - f(t_crit)                + X)
-
-        old_num_error_terms = self.zonotope_w.shape[0]
-        transformed_x[0, equal_bool] = f(l[equal_bool])
-        transformed_x[0, different_bool] = lambda_optimal[different_bool] * self.zonotope_w[0, different_bool] + new_consts[different_bool]
-        transformed_x[1:old_num_error_terms, different_bool] = self.zonotope_w[1:, different_bool] * lambda_optimal[different_bool]
-
-        indices = torch.arange(old_num_error_terms, old_num_error_terms + n_new_error_terms)
-        transformed_x[indices, has_new_error_term] = new_coeffs[different_bool]
-
-        return make_zonotope_new_weights_same_args(transformed_x, source_zonotope=self, clone=False)
 
     def reciprocal(self, original_implementation=True, y_positive_constraint=False) -> "Zonotope":
         """
@@ -1915,13 +2278,13 @@ class Zonotope:
             NEW_COEFFS = 0.5 * (lambdas * t_opt - t_opt.reciprocal() + X)
 
         # INTERCEPT = (t_opt.reciprocal() - lambdas * t_opt)
-        # isNan = torch.isnan(NEW_COEFFS[different_bool])
-        # if isNan.any().item():
-        #     print(l[different_bool][isNan])
-        #     print(u[different_bool][isNan])
-        #     a = 5
+        isNan = torch.isnan(NEW_COEFFS[different_bool])
+        if isNan.any().item():
+            print(l[different_bool][isNan])
+            print(u[different_bool][isNan])
+            a = 5
 
-        assert not torch.isnan(NEW_COEFFS[different_bool]).any(), "Reciprocal: there are NaNs in the new COEFFS, pre-condition not met"
+        assert not torch.isnan(NEW_COEFFS[different_bool]).any(), "Reciprocal: there are NaNs in the new COEFFS"
         # assert ((NEW_CONSTS - INTERCEPT)[different_bool] > -1-e5).all()
         assert (NEW_COEFFS[torch.logical_and(different_bool, NEW_COEFFS == NEW_COEFFS)]  >= -1e-4).all(), \
             "Reciprocal: there is a bad negative coeff: %f" % NEW_COEFFS[torch.logical_and(different_bool, NEW_COEFFS == NEW_COEFFS)].max().item()
@@ -1968,12 +2331,11 @@ class Zonotope:
         radius_coeffs = (error_terms_reshaped * radius_range)  # (num_words, embedding size, n_error_terms)
 
         new_zonotope_w = self.zonotope_w.clone()
-        new_zonotope_w[0] += center_coeffs  # inplace, does not matter for now
+        new_zonotope_w[0] += center_coeffs
         new_zonotope_w[1 + num_error_terms_to_skip:] = radius_coeffs.permute(2, 0, 1)  # (n_error_terms, num_words, embedding size)
 
         # We dont use make_zonotope_new_weights_same_args() on purpose, because we don't want to copy the error ranges to the new zonotope!
         return Zonotope(self.args, self.p, self.eps, self.perturbed_word_index, zonotope_w=new_zonotope_w)
-
 
 def to_original_indices(new_indices: torch.Tensor, mapping_original_to_new_indices: torch.Tensor):
     """
@@ -2218,6 +2580,9 @@ def add_equality_constraints(left_vars_w: torch.Tensor, right_vars_w: torch.tens
     error_term_low, error_term_high = iterated_alpha2(equality_eq=differences, iterations=3, number_initial_terms_whose_range_should_not_change=number_initial_terms_whose_range_should_not_change)
     assert (error_term_low <= error_term_high).all(), "add_equality_constraint: Error term high < error term low"
 
+    if error_term_low.max() > -1 or error_term_high.min() < 1:
+        a = 5
+
     constrained_zonotope.set_error_term_ranges(
         error_term_low[number_initial_terms_whose_range_should_not_change:],
         error_term_high[number_initial_terms_whose_range_should_not_change:]
@@ -2457,7 +2822,7 @@ def alpha2(equality_eq: torch.Tensor,
     return error_term_low, error_term_high
 
 
-def process_values(input_zonotope_w: torch.Tensor, source_zonotope: "Zonotope", A: int, num_rows: int, num_values: int, keep_intermediate_zonotopes: bool ):
+def process_values(input_zonotope_w: torch.Tensor, source_zonotope: "Zonotope", A: int, num_rows: int, num_values: int):
     ### Step 1: compute all the xj - xi
     # Self shape: (A, 1 + num_error_terms, num_rows, num_values)
     # Middle shape: (A, 1 + num_error_terms, num_rows, num_values, num_values)
@@ -2467,8 +2832,7 @@ def process_values(input_zonotope_w: torch.Tensor, source_zonotope: "Zonotope", 
 
     diffs_w = vals_w_repeated.transpose(3, 4) - vals_w_repeated
 
-    if not keep_intermediate_zonotopes:
-        del vals_w_repeated; cleanup_memory()
+    del vals_w_repeated; cleanup_memory()
 
     # End shape: (1 + num_error_terms, A * num_rows, num_values * num_values)?
     diffs_w_reshaped = diffs_w.permute(1, 0, 2, 3, 4).reshape(1 + source_zonotope.num_error_terms, A * num_rows, num_values * num_values)
@@ -2487,19 +2851,13 @@ def process_values(input_zonotope_w: torch.Tensor, source_zonotope: "Zonotope", 
     # Mid shape: (1 + num_error_terms, A, num_rows, num_values, num_values)
     # End shape: (A, 1 + num_error_terms, num_rows, num_values)
     diffs_exp_w_reshaped = incomplete_diffs_exp_w.reshape(-1, A, num_rows, num_values, num_values)
-
-    if not keep_intermediate_zonotopes:
-        del incomplete_diffs_exp_w
+    del incomplete_diffs_exp_w
 
     sum_exp_diffs_w = diffs_exp_w_reshaped.sum(dim=-1).permute(1, 0, 2, 3)  # (A, 1 + num_error_terms, num_rows, num_values)
-
-    if not keep_intermediate_zonotopes:
-        del diffs_exp_w_reshaped
+    del diffs_exp_w_reshaped
 
     # (A * num_rows, num_values * num_values) -> (A * num_rows, num_values)
     new_error_terms_collapsed = exp_new_error_term.reshape(A, num_rows, num_values, num_values).sum(dim=-1)
-
-    if not keep_intermediate_zonotopes:
-        del exp_new_error_term
+    del exp_new_error_term
 
     return sum_exp_diffs_w, new_error_terms_collapsed
