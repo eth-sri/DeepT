@@ -67,21 +67,6 @@ if (args.verify and args.attack_type == "synonym" and args.data == "sst") or arg
         for data in [data_valid, data_test]:
             for example in data:
                 tokens = example['sentence'].split()
-                # new_tokens = []
-                # i = 0
-                # while i < len(tokens):
-                #     if i >= len(tokens) - 2:
-                #         new_tokens.append(tokens[i])
-                #         i += 1
-                #         continue
-                #
-                #     if '-' not in tokens[i] and tokens[i + 1] == '-' and '-' not in tokens[i + 2]:
-                #         new_tokens.append(tokens[i] + tokens[i + 1] + tokens[i + 2])
-                #         i += 3
-                #     else:
-                #         new_tokens.append(tokens[i])
-                #         i += 1
-
                 example['sent_a'] = tokens
                 del example['sentence']
 
@@ -350,10 +335,6 @@ with sess.as_default():
         else:
             raise NotImplementedError()
         exit(0)
-
-    # if args.word_label:
-    #     eval_words(args, target, data_test)
-    #     exit(0)
 
     # test the accuracy
     if args.lirpa_data:
