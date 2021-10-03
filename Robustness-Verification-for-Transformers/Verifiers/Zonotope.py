@@ -21,25 +21,25 @@ from Verifiers.utils import INFINITY, dual_norm, DUAL_INFINITY
 epsilon = 1e-12
 
 
-def cleanup_memory():
+def cleanup_memory() -> None:
     gc.collect()
     torch.cuda.empty_cache()
 
 
-def get_bigger_smaller_tensor(x1: torch.Tensor, x2: torch.Tensor):
+def get_bigger_smaller_tensor(x1: torch.Tensor, x2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     if x1.size(0) >= x2.size(0):
         return x1, x2
     else:
         return x2, x1
 
 
-def sum_tensor_with_different_dim0_(x1: torch.Tensor, x2: torch.Tensor):
+def sum_tensor_with_different_dim0_(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     bigger, smaller = get_bigger_smaller_tensor(x1, x2)
     bigger[:smaller.size(0)] += smaller
     return bigger
 
 
-def sum_tensor_with_different_dim0_1(x1: torch.Tensor, x2: torch.Tensor):
+def sum_tensor_with_different_dim0_1(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     A1, B1, C, D = x1.shape
     A2, B2, C, D = x2.shape
     result = torch.zeros(max(A1, A2), max(B1, B2), C, D, device=x1.device)
@@ -57,7 +57,7 @@ def tensor_and(*tensors: torch.Tensor) -> torch.Tensor:
     return result
 
 
-def fillna(tensor: torch.Tensor, val: float):
+def fillna(tensor: torch.Tensor, val: float) -> None:
     tensor[tensor != tensor] = val
 
 
@@ -66,7 +66,7 @@ def get_norm(tensor: torch.Tensor, p: float, dim: Union[int, List[int]]) -> torc
     # return torch.norm(tensor, p=p, dim=dim)
 
 
-def get_num_error_terms(zonotope_weights: torch.Tensor):
+def get_num_error_terms(zonotope_weights: torch.Tensor) -> int:
     if zonotope_weights.ndim == 4:
         return zonotope_weights.size(1) - 1
     else:
@@ -218,7 +218,7 @@ class Zonotope:
         error_terms = self.zonotope_w[1:] if self.zonotope_w.ndim <= 3 else self.zonotope_w[:, 1:]
         return (error_terms != 0).any().item()
 
-    def get_num_error_terms(self):
+    def get_num_error_terms(self) -> int:
         error_dim = 0 if self.zonotope_w.ndim == 3 else 1
 
         assert self.num_error_terms == self.zonotope_w.shape[error_dim] - 1, \
@@ -401,7 +401,7 @@ class Zonotope:
         new_zonotope_w = self.zonotope_w.permute(1, 2, 0, 3).reshape(error_dim, length, A * embedding_size)
         return make_zonotope_new_weights_same_args(new_zonotope_w, source_zonotope=self, clone=clone)
 
-    def print(self, message: str):
+    def print(self, message: str) -> None:
         """ Print a message and then statistics about the bounds and norms of the error weights"""
         print("Zonotope Stats: ", message)
         l, u = self.concretize()
@@ -412,7 +412,7 @@ class Zonotope:
         print("max", torch.max(u))
         print()
 
-    def set_error_term_ranges(self, error_term_low: torch.Tensor, error_term_high: torch.Tensor):
+    def set_error_term_ranges(self, error_term_low: torch.Tensor, error_term_high: torch.Tensor) -> None:
         num_error_terms_whose_range_can_be_set = self.num_error_terms - self.num_input_error_terms_special_norm
 
         assert error_term_low.nelement() == num_error_terms_whose_range_can_be_set, "set_error_term_ranges: invalid number of low error ranges"
@@ -582,7 +582,7 @@ class Zonotope:
         else:
             assert False, "Matmul with weight matrix with %d dimensions not supported (exact shape = %s)" % (W.dim(), W.shape)
 
-    def multiply(self, other: Union[float, "Zonotope", torch.Tensor]):
+    def multiply(self, other: Union[float, "Zonotope", torch.Tensor]) -> "Zonotope":
         """ Multiply by either a float, Bounds or a matrix. Takes into account the signs to
         ensure the compute lower and upper bounds weights and biases are correct. """
         if isinstance(other, float):
@@ -1307,7 +1307,6 @@ class Zonotope:
         t_opt = torch.min(torch.min(t_crit, t_crit2), u)  # Idea: has to be below L + 1 (and <= U)
 
         if (t_opt == float('-inf')).any():
-            a = 5
             t_opt = torch.min(torch.min(t_crit, t_crit2), u)  # Idea: has to be below L + 1 (and <= U)
 
         # λ = f'(t) = e^t
@@ -2034,7 +2033,7 @@ def compute_width_heuristic(linear_terms: torch.Tensor, min_positions_per_term: 
 
 
 def change_mid_to_only_have_removable_error_terms(current_indices_for_sorted: torch.Tensor, sorted_ratios: torch.Tensor,
-                                                  sorted_linear_terms: torch.Tensor, sorting_indices: torch.Tensor, min_removable_error_term: int):
+                                                  sorted_linear_terms: torch.Tensor, sorting_indices: torch.Tensor, min_removable_error_term: int) -> None:
     # current_indices_for_sorted: shape - (num_equations)
     # sorted_ratios:              shape - (num_error_terms, num_equations)
     # sorted_linear_terms:        shape - (num_error_terms, num_equations)
@@ -2245,9 +2244,6 @@ def add_inequality_constraints(vars_w: torch.Tensor, source_zonotope: Zonotope, 
     assert lower_bound is not None or upper_bound is not None, "Illegal Arguments: both lower_bound and upper_bound is None"
     assert lower_bound < upper_bound, "Lower bound must be smaller than the upper bound"
 
-    # TODO: read the paper to precisely discover what alpha2 is and how it works
-    # They say it's "the pseudo inverse of the concretization" but I need make sure I understand their notation
-
     ##
     # x = c1 e1 + c2 e2 + ... + cn en <= 0
     #
@@ -2457,7 +2453,7 @@ def alpha2(equality_eq: torch.Tensor,
     return error_term_low, error_term_high
 
 
-def process_values(input_zonotope_w: torch.Tensor, source_zonotope: "Zonotope", A: int, num_rows: int, num_values: int, keep_intermediate_zonotopes: bool ):
+def process_values(input_zonotope_w: torch.Tensor, source_zonotope: "Zonotope", A: int, num_rows: int, num_values: int, keep_intermediate_zonotopes: bool) -> Tuple[torch.Tensor, int]:
     ### Step 1: compute all the xj - xi
     # Self shape: (A, 1 + num_error_terms, num_rows, num_values)
     # Middle shape: (A, 1 + num_error_terms, num_rows, num_values, num_values)
