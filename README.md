@@ -11,7 +11,7 @@ Neural networks for Natural Language Processing are vulnerable to
 adversarial examples, where a meaning-preserving change to the sentence
 causes the model to make incorrect predictions.
 
-![](./media/exampleAdversarialAttack.png)
+<img src="./media/exampleAdversarialAttack.png" width="500"/>
 
 The goal of the DeepT verifier is to **prove the local robustness** of Transformer
 networks against certain threat models for given input sequences. In other words, 
