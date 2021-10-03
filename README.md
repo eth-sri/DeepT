@@ -1,9 +1,66 @@
-# DeepT - Multi-norm zonotopes & Transformer certification
+# DeepT - Multi-norm Zonotopes & Transformer certification
 
-We present DeepT, a novel method for certifying Transformer networks based on 
-abstract interpretation. The key idea behind DeepT is our new multi-norm Zonotope
+We present **DeepT**, a novel method for certifying Transformer networks based on 
+abstract interpretation, as presented in our PLDI 2021 paper
+"[Fast and precise certification of transformers](https://dl.acm.org/doi/abs/10.1145/3453483.3454056)". This repository contains all code and data necessary to reproduce the
+results from the paper, as well as the complete experimental results.
+
+## Attacks & Certification of Natural Language Models
+
+Neural networks for Natural Language Processing are vulnerable to
+adversarial examples, where a meaning-preserving change to the sentence
+causes the model to make incorrect predictions.
+
+![](./media/exampleAdversarialAttack.png)
+
+The goal of the DeepT verifier is to **prove the local robustness** of Transformer
+networks against certain threat models for given input sequences. In other words, 
+given an input, we aim to guarantee the model will always produce the right 
+prediction for all variations of the input described by the threat model (synonym replacements
+and embedding changes, see Threat Models section below).
+
+![](./media/transformerCertification.png)
+
+## Multi-norm Zonotopes
+
+The key idea behind DeepT is our new multi-norm Zonotope
 abstract domain, an extension of the classical Zonotope designed to handle L1 
 and L2-norm bound perturbations. 
+
+We introduce all Multi-norm Zonotope abstract transformers necessary to handle
+these complex networks, including the challenging softmax function and dot 
+product. The abstract transformers are carefully constructed to strike a
+good balance between precision and performance.
+
+## Threat models
+
+We consider 2 threat models: attacks in the embedding space within a l^p ball and synonym attacks
+where each word may be replaced a synonym.
+
+![](./media/threatModels.png)
+
+## Transformer networks
+
+Transformer networks have delivered state-of-the-art
+performance across many NLP tasks, and were also successfully applied to a wide
+variety of other tasks including object detection, graph classification, speech
+recognition, and visual question answering. The core part of a Transformer
+network is a stack of self-attention layers. For NLP tasks, the
+first layer of this stack is preceded by an embedding layer,
+mapping words to vectors in an embedding space.  
+
+![](./media/transformerEncoder.png)
+
+
+## Evaluation Results
+
+Our evaluation shows that DeepT can certify average robustness radii that are $28\times$ 
+larger than the state-of-the-art, while scaling favorably. Further, for the 
+first time, we certify Transformers against synonym attacks on long sequences 
+of words, where each word can be replaced by any synonym. DeepT achieves a high
+certification success rate on sequences of words where enumeration-based 
+verification would take 2 to 3 orders of magnitude more time.
+
 
 ## Requirements
 
